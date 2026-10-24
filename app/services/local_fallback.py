@@ -366,7 +366,9 @@ def claim_local_video_alert(notification_id, now):
                         and notification.get("status") == "pending"):
                     notification.update({"status": "sending",
                         "attempts": int(notification.get("attempts", 0)) + 1,
-                        "last_attempt_at": now})
+                        "last_attempt_at": now,
+                        "delivery_protocol_version": 2})
+                    notification.pop("smtp_transmission_started_at", None)
                     row["updated_at"] = now
                     _write(rows)
                     return dict(notification)
@@ -386,25 +388,47 @@ def update_local_video_alert(notification_id, changes):
         return False
 
 
-def recover_local_video_alerts():
-    """Never retry after a worker restart once SMTP transmission might have begun."""
+def recover_local_video_alerts(stale_before=None, video_id=None):
+    """Resolve stale sends; retry only v2 attempts known not to have reached SMTP."""
     with _lock:
         rows = _read()
         changed = False
+        recovered_count = 0
         now = datetime.now(timezone.utc)
         for row in rows:
+            if video_id and str(row.get("_id")) != str(video_id):
+                continue
             for notification in row.get("email_alert_notifications", []):
-                if notification.get("status") == "sending":
-                    notification.update({"status": "uncertain", "recovered_at": now,
-                        "failure_reason": "Delivery was interrupted after SMTP transmission may have begun; automatic resend was suppressed."})
-                    changed = True
+                if notification.get("status") != "sending":
+                    continue
+                attempted_at = notification.get("last_attempt_at")
+                if isinstance(attempted_at, str):
+                    try:
+                        attempted_at = datetime.fromisoformat(attempted_at.replace("Z", "+00:00"))
+                    except ValueError:
+                        attempted_at = None
+                if isinstance(attempted_at, datetime) and attempted_at.tzinfo is None:
+                    attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+                if stale_before and isinstance(attempted_at, datetime) and attempted_at > stale_before:
+                    continue
+                can_retry = (notification.get("delivery_protocol_version") == 2
+                             and not notification.get("smtp_transmission_started_at"))
+                status = "pending" if can_retry else "uncertain"
+                reason = ("Delivery worker stopped before SMTP transmission; safe retry queued."
+                          if can_retry else
+                          "Delivery was interrupted after SMTP transmission may have begun; automatic resend was suppressed.")
+                notification.update({"status": status, "recovered_at": now,
+                                     "failure_reason": reason})
+                changed = True
+                recovered_count += 1
         if changed:
             _write(rows)
+        return recovered_count
 
 
 def list_pending_incidents(status="", start=None, end=None, limit=1000):
     """Return real reviewable events from local-only records."""
-    excluded = {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit"}
+    excluded = {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap"}
     with _lock:
         rows = _read()
     incidents = []
@@ -442,7 +466,7 @@ def update_pending_incident(event_id, status, notes):
         for row in rows:
             for event in row.get("local_events", []):
                 if str(event.get("_id")) == str(event_id) and event.get("superseded") is not True:
-                    if event.get("event_type") in {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit"}:
+                    if event.get("event_type") in {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap"}:
                         return False
                     event.update({"incident_status": status, "review_notes": str(notes or "")[:4000],
                                   "review_updated_at": now})

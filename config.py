@@ -63,6 +63,7 @@ class Config:
     ALERT_SENDER_EMAIL = os.getenv("ALERT_SENDER_EMAIL", "").strip()
     ALERT_RECIPIENT_EMAILS = [value.strip() for value in os.getenv("ALERT_RECIPIENT_EMAILS", "").split(",") if value.strip()]
     ALERT_SMTP_TIMEOUT_SECONDS = float(os.getenv("ALERT_SMTP_TIMEOUT_SECONDS", "10"))
+    ALERT_SENDING_STALE_SECONDS = int(os.getenv("ALERT_SENDING_STALE_SECONDS", "900"))
     ALERT_MAX_GIF_BYTES = int(os.getenv("ALERT_MAX_GIF_BYTES", str(3 * 1024 * 1024)))
     ALERT_GIF_WIDTH = int(os.getenv("ALERT_GIF_WIDTH", "320"))
     ALERT_EPISODE_MERGE_GAP_SECONDS = float(os.getenv("ALERT_EPISODE_MERGE_GAP_SECONDS", "1.0"))

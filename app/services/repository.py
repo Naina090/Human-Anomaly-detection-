@@ -265,7 +265,7 @@ def save_events(video_id, job_id, events):
             event.setdefault("created_at", now)
             if event.get("event_type") in _ALERTABLE_EVENTS:
                 event.setdefault("alert_delivery", _new_alert_delivery(video_id, event))
-            if event.get("event_type") not in {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit"}:
+            if event.get("event_type") not in {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap"}:
                 event.setdefault("incident_status", "new")
                 event.setdefault("review_notes", "")
         return save_pending_events(video_id, events)
@@ -279,7 +279,7 @@ def save_events(video_id, job_id, events):
         if item.get("event_type") in _ALERTABLE_EVENTS:
             item.setdefault("alert_delivery", _new_alert_delivery(video_id, item))
             event.setdefault("alert_delivery", item["alert_delivery"])
-        if item.get("event_type") not in {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit"}:
+        if item.get("event_type") not in {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap"}:
             item.setdefault("incident_status", "new")
             item.setdefault("review_notes", "")
         documents.append(item)
@@ -439,7 +439,9 @@ def claim_video_alert(notification_id):
             {"email_alert_notifications.notification_id": str(notification_id),
              "email_alert_notifications.status": "pending"},
             {"$set": {"email_alert_notifications.$.status": "sending",
-                      "email_alert_notifications.$.last_attempt_at": now},
+                      "email_alert_notifications.$.last_attempt_at": now,
+                      "email_alert_notifications.$.delivery_protocol_version": 2},
+             "$unset": {"email_alert_notifications.$.smtp_transmission_started_at": ""},
              "$inc": {"email_alert_notifications.$.attempts": 1}},
             return_document=ReturnDocument.AFTER)
         if not doc:
@@ -463,30 +465,64 @@ def update_video_alert(notification_id, changes):
         {"$set": flattened}).matched_count == 1)
 
 
-def recover_video_alerts():
+def recover_video_alerts(stale_after_seconds=900, video_id=None):
+    """Resolve only stale sends; never auto-resend an ambiguous SMTP attempt.
+
+    A v2 reservation with no durable transmission marker was interrupted while
+    preparing evidence and is safe to return to pending. Any legacy or marked
+    attempt may have reached SMTP and is moved to uncertain instead.
+    """
     from app.services.local_fallback import recover_local_video_alerts
-    recover_local_video_alerts()
     now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=max(60, int(stale_after_seconds)))
+    local_recovered = recover_local_video_alerts(cutoff, str(video_id) if video_id else None)
+    oid = object_id(video_id) if video_id else None
     def recover(db):
         count = 0
-        docs = list(db.videos.find({"email_alert_notifications.status": "sending"},
-                                   {"email_alert_notifications": 1}))
+        query = {"email_alert_notifications.status": "sending"}
+        if oid:
+            query["_id"] = oid
+        docs = list(db.videos.find(query, {"email_alert_notifications": 1}))
         for doc in docs:
             for item in doc.get("email_alert_notifications", []):
-                if item.get("status") == "sending":
-                    result = db.videos.update_one({"_id": doc["_id"],
-                        "email_alert_notifications.notification_id": item.get("notification_id"),
-                        "email_alert_notifications.status": "sending"}, {"$set": {
-                            "email_alert_notifications.$.status": "uncertain",
+                if item.get("status") != "sending":
+                    continue
+                attempted_at = item.get("last_attempt_at")
+                if isinstance(attempted_at, datetime):
+                    if attempted_at.tzinfo is None:
+                        attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+                    if attempted_at > cutoff:
+                        continue
+                elif attempted_at:
+                    try:
+                        parsed = datetime.fromisoformat(str(attempted_at).replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        if parsed > cutoff:
+                            continue
+                    except ValueError:
+                        pass
+                can_retry = (item.get("delivery_protocol_version") == 2
+                             and not item.get("smtp_transmission_started_at"))
+                new_status = "pending" if can_retry else "uncertain"
+                reason = ("Delivery worker stopped before SMTP transmission; safe retry queued."
+                          if can_retry else
+                          "Delivery was interrupted after SMTP transmission may have begun; automatic resend was suppressed.")
+                attempt_match = ({"$in": [None]} if item.get("last_attempt_at") is None
+                                 else item.get("last_attempt_at"))
+                result = db.videos.update_one({"_id": doc["_id"],
+                    "email_alert_notifications": {"$elemMatch": {
+                        "notification_id": item.get("notification_id"), "status": "sending",
+                        "last_attempt_at": attempt_match}}}, {"$set": {
+                            "email_alert_notifications.$.status": new_status,
                             "email_alert_notifications.$.recovered_at": now,
-                            "email_alert_notifications.$.failure_reason":
-                                "Delivery was interrupted after SMTP transmission may have begun; automatic resend was suppressed."}})
-                    count += result.modified_count
+                            "email_alert_notifications.$.failure_reason": reason}})
+                count += result.modified_count
         return count
     try:
-        return _run(recover)
+        return local_recovered + _run(recover)
     except DatabaseUnavailable:
-        return 0
+        return local_recovered
 
 
 def list_pending_alerts(video_id=None, limit=100):
@@ -554,7 +590,7 @@ def recover_alert_deliveries():
 
 def list_incidents(status="", start=None, end=None, limit=1000):
     allowed = {"new", "reviewing", "resolved", "false_positive"}
-    query = {"event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit"]}, "superseded": {"$ne": True}}
+    query = {"event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap"]}, "superseded": {"$ne": True}}
     if status in allowed:
         query["incident_status"] = status
     if start or end:
@@ -585,7 +621,7 @@ def update_incident(event_id, status, notes):
     if update_pending_incident(str(event_id), status, notes):
         return True
     def update(db):
-        event = db.detection_events.find_one({"_id": oid, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit"]},
+        event = db.detection_events.find_one({"_id": oid, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap"]},
                                               "superseded": {"$ne": True}},
                                              {"video_id": 1})
         if not event or not isinstance(event.get("video_id"), ObjectId):
@@ -593,7 +629,7 @@ def update_incident(event_id, status, notes):
         if db.videos.find_one({"_id": event["video_id"]}, {"_id": 1}) is None:
             return False
         result = db.detection_events.update_one(
-            {"_id": oid, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit"]}, "superseded": {"$ne": True}},
+            {"_id": oid, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap"]}, "superseded": {"$ne": True}},
             {"$set": {"incident_status": status, "review_notes": notes,
                        "review_updated_at": datetime.now(timezone.utc)}})
         return result.modified_count == 1 or result.matched_count == 1
@@ -723,9 +759,9 @@ def dashboard_stats():
         active = videos.count_documents({"processing_status": {"$in": ["queued", "processing"]}})
         # Dashboard anomaly metrics intentionally exclude ordinary object
         # observations. Those are shown separately on per-video results.
-        active_events = {"superseded": {"$ne": True}, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "RESTRICTED_ZONE_ENTRY"]}}
-        category_events = {"superseded": {"$ne": True}, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit"]}}
-        event_feed = {"superseded": {"$ne": True}, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit"]}}
+        active_events = {"superseded": {"$ne": True}, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap", "RESTRICTED_ZONE_ENTRY"]}}
+        category_events = {"superseded": {"$ne": True}, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap"]}}
+        event_feed = {"superseded": {"$ne": True}, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap"]}}
         event_count = events.count_documents(active_events)
         object_query = {"superseded": {"$ne": True}, "event_type": "object_detection"}
         object_observations = events.count_documents(object_query)
@@ -793,7 +829,7 @@ def dashboard_stats():
     result["processing"] += sum(row.get("processing_status") == "processing" for row in local)
     result["active"] += sum(row.get("processing_status") in {"waiting_for_mongodb", "queued", "processing"}
                              for row in local)
-    excluded = {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "RESTRICTED_ZONE_ENTRY"}
+    excluded = {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap", "RESTRICTED_ZONE_ENTRY"}
     anomaly_events = [event for event in local_events if event.get("event_type") not in excluded]
     result["events"] += len(anomaly_events)
     result["restricted_zone_entries"] += sum(event.get("event_type") == "RESTRICTED_ZONE_ENTRY" for event in local_events)
@@ -818,7 +854,7 @@ def dashboard_stats():
     result["recent"] = list(result["recent"])
     result["recent"].extend({**event, "original_filename": row.get("original_filename", "Local video")}
                             for row in local for event in row.get("local_events", [])
-                            if event.get("superseded") is not True and event.get("event_type") not in {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit"})
+                        if event.get("superseded") is not True and event.get("event_type") not in {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap"})
     result["recent"].sort(key=lambda event: str(event.get("created_at", "")), reverse=True)
     result["recent"] = result["recent"][:8]
     result["recent_videos"] = (result["recent_videos"] + local)[:6]
@@ -840,7 +876,7 @@ def list_videos(search="", status="", page=1, per_page=25):
         docs = list(coll.find(query).sort("upload_date", DESCENDING).limit(page * per_page))
         event_counts = {row["_id"]: row["count"] for row in db.detection_events.aggregate([
             {"$match": {"video_id": {"$in": [d["_id"] for d in docs]},
-                        "superseded": {"$ne": True}, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "RESTRICTED_ZONE_ENTRY"]}}},
+                        "superseded": {"$ne": True}, "event_type": {"$nin": ["object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap", "RESTRICTED_ZONE_ENTRY"]}}},
             {"$group": {"_id": "$video_id", "count": {"$sum": 1}}},
         ])} if docs else {}
         entry_counts = {row["_id"]: row["count"] for row in db.detection_events.aggregate([
@@ -875,7 +911,7 @@ def list_videos(search="", status="", page=1, per_page=25):
     from app.services.local_fallback import list_pending_videos
     local, local_total = list_pending_videos(search, status, 1, page * per_page)
     for row in local:
-        excluded = {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "RESTRICTED_ZONE_ENTRY"}
+        excluded = {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap", "RESTRICTED_ZONE_ENTRY"}
         row["event_count"] = sum(event.get("event_type") not in excluded
                                   for event in row.get("local_events", []))
         row["restricted_zone_entry_count"] = sum(event.get("event_type") == "RESTRICTED_ZONE_ENTRY"

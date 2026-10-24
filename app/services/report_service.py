@@ -16,6 +16,13 @@ def explain_event(event):
         return (f"A temporal video classifier emitted a candidate Violence-class interval using {method}."
                 f"{score_text} The classifier does not localize a person or establish polygon-zone membership; "
                 "sports, rough play, and other intense interactions can be confused with violence. Human review is required.")
+    if event.get("event_type") == "zone_tracking_gap":
+        details = event.get("details") or {}
+        gap = details.get("observation_gap_seconds")
+        gap_text = f"{float(gap):.2f}" if isinstance(gap, (int, float)) else "an unknown"
+        return (f"Temporary track {event.get('track_id')} resumed observations after a {gap_text} second gap "
+                f"in {details.get('zone_name') or details.get('zone_id') or 'the zone'}. "
+                "The missing observations do not prove an exit, re-entry, or identity continuity.")
     if kind == "object detection":
         confidence = event.get("confidence")
         score = f" Model confidence: {confidence}." if confidence is not None else " No confidence value was supplied."
@@ -133,6 +140,7 @@ def video_report_csv(video, events):
     """Return a flat report with one metadata row and one row per stored event."""
     output = io.StringIO(newline="")
     columns = ["record_type", "video_id", "filename", "status", "duration_seconds",
+               "processing_duration_seconds", "annotated_output_status", "annotated_output_format",
                "sample_interval_seconds", "pose_status", "pose_model", "pose_model_version",
                "pose_frames_sampled", "object_status", "object_model", "object_counts_by_class",
                "person_track_count_estimate", "fight_status", "fight_model", "summary", "event_type", "label",
@@ -146,6 +154,11 @@ def video_report_csv(video, events):
         "filename": video.get("original_filename", ""),
         "status": video.get("processing_status", ""),
         "duration_seconds": video.get("duration", ""),
+        "processing_duration_seconds": video.get("processing_duration", ""),
+        "annotated_output_status": video.get("annotated_output_status", ""),
+        "annotated_output_format": " / ".join(str(value) for value in (
+            (video.get("annotated_output_metadata") or {}).get("codec"),
+            (video.get("annotated_output_metadata") or {}).get("container")) if value),
         "sample_interval_seconds": (video.get("analysis_settings") or {}).get("sample_every_seconds", ""),
         "pose_status": (video.get("pose_analysis") or {}).get("status", ""),
         "pose_model": (video.get("pose_analysis") or {}).get("model_name", ""),

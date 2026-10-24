@@ -4,17 +4,19 @@ import logging
 import time
 import os.path
 import math
+import hashlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from bson import ObjectId
-from flask import Blueprint, current_app, render_template, request, redirect, url_for, flash, send_from_directory, abort, jsonify, Response
+from flask import Blueprint, current_app, render_template, request, redirect, url_for, flash, send_file, abort, jsonify, Response
 from werkzeug.utils import secure_filename
 from app.services.repository import (create_video, get_video, get_events, update_video,
     create_job, update_job, get_job_for_video, get_face_frames, save_face_frames,
     get_pose_frames, save_pose_frames, claim_job)
 from app.db import DatabaseUnavailable
 from app.services.storage import safe_video_path, safe_processed_path
-from app.services.video_processor import analyze_video, VideoError, make_browser_playable_webm
+from app.services.video_processor import (analyze_video, VideoError, make_browser_playable_webm,
+                                          make_browser_playable_mp4)
 from app.services.timestamps import event_video_seconds, format_video_timestamp
 from app.services.fall_detector import YoloPoseFallDetector, DetectorUnavailable, detector_status, METHOD as POSE_METHOD
 from app.services.face_detector import OpenCVFaceDetector, FaceDetectorUnavailable, detector_status as face_detector_status
@@ -190,7 +192,14 @@ def _run_analysis(app, video_id, job_id, path):
             return function(*args, **kwargs)
         finally:
             worker_profile["database_local_persistence_seconds"] += time.perf_counter() - persist_started
-    output_path = os.path.join(app.config["PROCESSED_DIR"], video_id + "_annotated.webm")
+    output_name = video_id + "_annotated.webm"
+    output_path = os.path.join(app.config["PROCESSED_DIR"], output_name)
+    compatibility_output_path = None
+    if os.path.exists(output_path):
+        # Retries must not replace an older annotated artifact for the same
+        # record. The selected internal name is persisted with final results.
+        output_name = video_id + "_annotated_" + uuid.uuid4().hex[:8] + ".webm"
+        output_path = os.path.join(app.config["PROCESSED_DIR"], output_name)
     try:
         with app.app_context():
             claimed_job = claim_job(job_id)
@@ -305,7 +314,6 @@ def _run_analysis(app, video_id, job_id, path):
                 "candidate_event_count": 0,
                 "error_message": fight_init_error,
             }})
-            output_name = video_id + "_annotated.webm"
             output_path = output_path if (detector or face_detector or object_detector or fight_detector or zones) else None
             last_progress = [-1]
             def record_progress(percent):
@@ -323,6 +331,22 @@ def _run_analysis(app, video_id, job_id, path):
                                    zone_boundary_margin_px=app.config.get("ZONE_BOUNDARY_MARGIN_PX", 8),
                                    fight_detector=fight_detector,
                                    output_max_width=app.config.get("ANNOTATED_OUTPUT_MAX_WIDTH", 640))
+            if result.get("annotated_output") and output_path:
+                compatibility_name = os.path.splitext(output_name)[0] + ".mp4"
+                compatibility_output_path = os.path.join(app.config["PROCESSED_DIR"], compatibility_name)
+                if os.path.exists(compatibility_output_path):
+                    compatibility_name = video_id + "_annotated_" + uuid.uuid4().hex[:8] + ".mp4"
+                    compatibility_output_path = os.path.join(app.config["PROCESSED_DIR"], compatibility_name)
+                encode_started = time.perf_counter()
+                mp4_metadata = make_browser_playable_mp4(output_path, compatibility_output_path)
+                result.setdefault("stage_timings", {})["browser_h264_transcode_seconds"] = time.perf_counter() - encode_started
+                if mp4_metadata:
+                    output_name = compatibility_name
+                    result["annotated_output_metadata"] = mp4_metadata
+                    result["annotated_playback_note"] = "Validated H.264/MP4 playback copy created; the original annotated WebM was preserved."
+                else:
+                    compatibility_output_path = None
+                    result["annotated_playback_note"] = "H.264/MP4 playback copy could not be created; the original annotated WebM remains available."
             if not result.get("annotated_output") and output_path and os.path.isfile(output_path):
                 os.remove(output_path)
             if result["events"]:
@@ -407,7 +431,7 @@ def _run_analysis(app, video_id, job_id, path):
                                "active_zone_count": len(active_zones), "events_inside_active_zones": 0,
                                "error_message": "Zone polygons were saved, but no configured pose model produced localized anomaly events for this run."}
             anomaly_events = [event for event in result["events"]
-                              if event.get("event_type") not in {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "RESTRICTED_ZONE_ENTRY"}]
+                              if event.get("event_type") not in {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap", "RESTRICTED_ZONE_ENTRY"}]
             object_events = [event for event in result["events"]
                              if event.get("event_type") == "object_detection"]
             result_profile = dict(result.get("stage_timings") or {})
@@ -444,7 +468,12 @@ def _run_analysis(app, video_id, job_id, path):
                 "fight_analysis": fight_result,
                 "analysis_summary": build_analysis_summary(result, result.get("sample_interval_seconds", app.config["SAMPLE_EVERY_SECONDS"])),
                 "analysis_stage_timings": result_profile,
-                "processed_filename": output_name if result.get("annotated_output") else None})
+                "processed_filename": output_name if result.get("annotated_output") else None,
+                "annotated_output_status": ("ready" if result.get("annotated_output") else
+                                             "unavailable" if result.get("annotated_output_error") else "not_requested"),
+                "annotated_output_metadata": result.get("annotated_output_metadata"),
+                "annotated_playback_note": result.get("annotated_playback_note"),
+                "annotated_output_error": result.get("annotated_output_error")})
             worker_profile["final_video_persistence_seconds"] = time.perf_counter() - stage_started
             if not video_saved:
                 raise RuntimeError("Final analysis results were not confirmed persisted to the video record.")
@@ -481,14 +510,18 @@ def _run_analysis(app, video_id, job_id, path):
                   video_id[:8], type(exc).__name__, sanitized_traceback(exc, app.config))
         _fail_analysis(app, video_id, job_id, started, "The video could not be processed. Check the video codec and model configuration.")
     finally:
-        if os.path.isfile(os.path.join(app.config["PROCESSED_DIR"], video_id + "_annotated.webm")):
+        if ((output_path and os.path.isfile(output_path)) or
+                (compatibility_output_path and os.path.isfile(compatibility_output_path))):
             with app.app_context():
                 row = get_video(video_id)
-                if not row or not row.get("processed_filename"):
-                    try:
-                        os.remove(os.path.join(app.config["PROCESSED_DIR"], video_id + "_annotated.webm"))
-                    except OSError:
-                        log.warning("Could not remove incomplete processed video for record %s.", video_id[:8])
+                if not row or row.get("processing_status") != "complete":
+                    for generated_path in (output_path, compatibility_output_path):
+                        if (generated_path and os.path.isfile(generated_path) and
+                                (not row or os.path.basename(generated_path) != row.get("processed_filename"))):
+                            try:
+                                os.remove(generated_path)
+                            except OSError:
+                                log.warning("Could not remove incomplete processed video for record %s.", video_id[:8])
         app.extensions["processing_slots"].release()
 
 
@@ -511,6 +544,20 @@ def _fail_analysis(app, video_id, job_id, started, message):
 
 @bp.get("/results/<video_id>")
 def results(video_id):
+    if ObjectId.is_valid(video_id):
+        from app.services.repository import recover_video_alerts
+        try:
+            recovered = recover_video_alerts(
+                current_app.config.get("ALERT_SENDING_STALE_SECONDS", 900), video_id)
+            if recovered:
+                # Recovery may return only previously reserved, definitely
+                # pre-SMTP attempts to pending. The atomic worker claim keeps
+                # page refreshes from creating or duplicating a digest.
+                from app.services.notifier import schedule_pending_alerts
+                schedule_pending_alerts(current_app._get_current_object(), video_id)
+        except Exception as exc:
+            log.warning("Could not reconcile stale email status for video %s (%s).",
+                        video_id[:8], type(exc).__name__)
     video = get_video(video_id)
     if not video:
         abort(404)
@@ -570,7 +617,9 @@ def results(video_id):
     for face_frame in face_frames:
         face_frame["timestamp"] = face_frame.get("timestamp_seconds", 0)
     for event in events:
-        event["category"] = event.get("event_type", "Uncategorized")
+        event["category"] = ("Suspected Violence-Related Activity"
+                             if event.get("event_type") == "SUSPECTED_FIGHTING"
+                             else event.get("event_type", "Uncategorized"))
         timestamp = event_video_seconds(event)
         event["timestamp_seconds"] = timestamp
         event["timestamp"] = timestamp
@@ -580,6 +629,7 @@ def results(video_id):
                                      if timestamp is not None and event.get("video_timestamp")
                                      else "Time unavailable")
         event["initial_occupancy"] = event.get("event_type") == "zone_presence_observed"
+        event["track_segment"] = event.get("track_segment_id") or (event.get("details") or {}).get("track_segment_id")
         if event["initial_occupancy"]:
             event["zone_time_label"] = (f"Initial occupancy — entry time not observed (observed at {event['video_timestamp']})"
                                          if event.get("video_timestamp") else
@@ -587,6 +637,12 @@ def results(video_id):
         elif event.get("event_type") == "RESTRICTED_ZONE_ENTRY":
             event["zone_time_label"] = (f"Entry time {event['video_timestamp']}" if event.get("video_timestamp")
                                          else "Entry time unavailable in this legacy record")
+        elif event.get("event_type") == "zone_tracking_gap":
+            details = event.get("details") or {}
+            prior = details.get("last_observed_timestamp_seconds")
+            event["zone_time_label"] = (f"Tracking gap observed at {event['video_timestamp']} (last seen at {format_video_timestamp(prior)}; no exit inferred)"
+                                         if event.get("video_timestamp") and isinstance(prior, (int, float))
+                                         else "Tracking continuity gap; no exit inferred")
         for bound in ("start_timestamp_seconds", "end_timestamp_seconds"):
             try:
                 point = float(event.get(bound))
@@ -604,6 +660,11 @@ def results(video_id):
         except (TypeError, ValueError):
             event["time_range_label"] = None
         event["score"] = event.get("model_score", event.get("anomaly_score", event.get("confidence")))
+        try:
+            numeric_score = float(event["score"])
+            event["score_label"] = f"{numeric_score:.3f}" if math.isfinite(numeric_score) else None
+        except (TypeError, ValueError):
+            event["score_label"] = str(event["score"]) if event["score"] is not None else None
         event["method"] = event.get("detection_method", "Unknown")
         event["label"] = event.get("label", "")
         event["track"] = event.get("track_id")
@@ -630,6 +691,43 @@ def results(video_id):
                            pose_frames=pose_frames,
                            event_types=event_types, event_labels=event_labels, event_tracks=event_tracks,
                            event_limit_reached=len(events) >= 2000)
+
+
+@bp.get("/api/videos/<video_id>/alerts")
+def alert_status(video_id):
+    """Return saved alert status; only stale, already-reserved safe retries may resume."""
+    if not ObjectId.is_valid(video_id):
+        abort(404)
+    from app.services.repository import recover_video_alerts
+    try:
+        recovered = recover_video_alerts(
+            current_app.config.get("ALERT_SENDING_STALE_SECONDS", 900), video_id)
+        if recovered:
+            from app.services.notifier import schedule_pending_alerts
+            schedule_pending_alerts(current_app._get_current_object(), video_id)
+    except Exception as exc:
+        log.warning("Could not reconcile email status for video %s (%s).", video_id[:8], type(exc).__name__)
+    video = get_video(video_id)
+    if not video:
+        abort(404)
+    notifications = []
+    for item in video.get("email_alert_notifications", []):
+        episodes = item.get("episodes") or []
+        notifications.append({
+            "status": item.get("status", "pending"),
+            "sent_at": item.get("sent_at").isoformat() if hasattr(item.get("sent_at"), "isoformat") else item.get("sent_at"),
+            "last_attempt_at": item.get("last_attempt_at").isoformat() if hasattr(item.get("last_attempt_at"), "isoformat") else item.get("last_attempt_at"),
+            "failure_reason": item.get("failure_reason"),
+            "gif_available": bool(item.get("gif_filename")),
+            "categories": sorted({str(ep.get("event_type", "candidate")) for ep in episodes}),
+            "episode_count": len(episodes),
+        })
+    sent_count = sum(item.get("status") == "sent" for item in notifications)
+    return jsonify({"notifications": notifications,
+                    "reserved_count": len(notifications),
+                    "sent_count": sent_count,
+                    "maximum": 2,
+                    "limit_reached": bool(video.get("alert_email_limit_reached"))})
 
 
 @bp.get("/results/<video_id>/report.csv")
@@ -711,7 +809,10 @@ def media(video_id):
     target = safe_video_path(video, current_app.config["UPLOAD_DIR"])
     if not target:
         abort(404)
-    return send_from_directory(current_app.config["UPLOAD_DIR"], os.path.basename(target), as_attachment=False)
+    extension = os.path.splitext(target)[1].lower()
+    mime = {".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+            ".avi": "video/x-msvideo"}.get(extension, "application/octet-stream")
+    return send_file(target, mimetype=mime, as_attachment=False, conditional=True, etag=True)
 
 
 @bp.get("/media/<video_id>/download")
@@ -722,8 +823,35 @@ def download_media(video_id):
     target = safe_video_path(video, current_app.config["UPLOAD_DIR"])
     if not target:
         abort(404)
-    return send_from_directory(current_app.config["UPLOAD_DIR"], os.path.basename(target),
-                               as_attachment=True, download_name=video.get("original_filename", "video"))
+    return send_file(target, mimetype="application/octet-stream", as_attachment=True,
+                     download_name=video.get("original_filename", "video"), conditional=True, etag=True)
+
+
+def _browser_compatible_processed_path(video, target):
+    """Prefer explicit H.264/MP4 metadata; safely cache a playable copy for legacy WebM."""
+    extension = os.path.splitext(target)[1].lower()
+    metadata = video.get("annotated_output_metadata") or {}
+    if extension == ".mp4" and "h264" in str(metadata.get("codec", "")).lower().replace(".", ""):
+        return target
+    if extension == ".webm":
+        try:
+            stat = os.stat(target)
+            signature = f"{os.path.basename(target)}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")
+            token = hashlib.sha256(signature).hexdigest()[:8]
+            sidecar_name = str(video["_id"]) + "_annotated_" + token + ".mp4"
+            sidecar = os.path.join(current_app.config["PROCESSED_DIR"], sidecar_name)
+            if make_browser_playable_mp4(target, sidecar):
+                safe_sidecar = safe_processed_path({"processed_filename": sidecar_name}, current_app.config["PROCESSED_DIR"])
+                if safe_sidecar:
+                    return safe_sidecar
+        except (OSError, KeyError, ValueError):
+            pass
+        return target
+    if extension == ".mp4":
+        browser_path = os.path.join(current_app.config["PROCESSED_DIR"], str(video["_id"]) + "_annotated.webm")
+        if make_browser_playable_webm(target, browser_path):
+            return browser_path
+    return target
 
 
 @bp.get("/processed/<video_id>")
@@ -733,12 +861,14 @@ def processed_media(video_id):
         abort(404)
     target = safe_processed_path(video, current_app.config["PROCESSED_DIR"])
     if not target:
-        abort(404)
-    if os.path.splitext(target)[1].lower() == ".mp4":
-        browser_path = os.path.join(current_app.config["PROCESSED_DIR"], str(video["_id"]) + "_annotated.webm")
-        if make_browser_playable_webm(target, browser_path):
-            target = browser_path
-    return send_from_directory(current_app.config["PROCESSED_DIR"], os.path.basename(target), as_attachment=False)
+        if video.get("processing_status") in {"queued", "processing"}:
+            return jsonify({"error_code": "processing", "message": "Annotated video is still processing."}), 409
+        return jsonify({"error_code": "missing", "message": video.get("annotated_output_error") or
+                        "The saved annotated video is unavailable."}), 404
+    target = _browser_compatible_processed_path(video, target)
+    extension = os.path.splitext(target)[1].lower()
+    mime = "video/webm" if extension == ".webm" else "video/mp4"
+    return send_file(target, mimetype=mime, as_attachment=False, conditional=True, etag=True)
 
 
 
@@ -750,10 +880,8 @@ def download_processed_media(video_id):
     target = safe_processed_path(video, current_app.config["PROCESSED_DIR"])
     if not target:
         abort(404)
-    if os.path.splitext(target)[1].lower() == ".mp4":
-        browser_path = os.path.join(current_app.config["PROCESSED_DIR"], str(video["_id"]) + "_annotated.webm")
-        if make_browser_playable_webm(target, browser_path):
-            target = browser_path
+    target = _browser_compatible_processed_path(video, target)
     extension = os.path.splitext(target)[1].lower()
-    return send_from_directory(current_app.config["PROCESSED_DIR"], os.path.basename(target),
-                               as_attachment=True, download_name="annotated-analysis" + extension)
+    mime = "video/webm" if extension == ".webm" else "video/mp4"
+    return send_file(target, mimetype=mime, as_attachment=True,
+                     download_name="annotated-analysis" + extension, conditional=True, etag=True)

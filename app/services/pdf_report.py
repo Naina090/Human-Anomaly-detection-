@@ -23,6 +23,7 @@ def report_lines(video, job, events):
     pose = video.get("pose_analysis") or {}
     objects = video.get("object_analysis") or {}
     fighting = video.get("fight_analysis") or {}
+    annotated = video.get("annotated_output_metadata") or {}
     episodes = group_event_episodes(events)
     categories = {}
     for episode in episodes:
@@ -36,6 +37,7 @@ def report_lines(video, job, events):
         f"Processing status: {_display(video.get('processing_status'))}",
         f"Uploaded: {_display(video.get('upload_date'))}",
         f"Duration (seconds): {_display(video.get('duration'))}",
+        f"Processing duration (seconds): {_display(video.get('processing_duration'))}",
         f"Job status: {_display((job or {}).get('status'))}",
         f"Job started: {_display((job or {}).get('started_at'))}",
         f"Job completed: {_display((job or {}).get('completed_at'))}",
@@ -45,6 +47,9 @@ def report_lines(video, job, events):
         f"Object observations by class: {_display(objects.get('counts_by_class') or 'No saved class counts')}",
         f"Fighting detector: {_display(fighting.get('model_name'))} / {_display(fighting.get('status'))}",
         f"Fighting candidate intervals: {_display(fighting.get('candidate_event_count', 0))}",
+        f"Annotated output status: {_display(video.get('annotated_output_status'))}",
+        f"Annotated output format: {_display(annotated.get('codec'))} / {_display(annotated.get('container'))}",
+        f"Annotated output dimensions / duration / bytes: {_display(annotated.get('width'))}x{_display(annotated.get('height'))} / {_display(annotated.get('duration_seconds'))} sec / {_display(annotated.get('size_bytes'))}",
         f"Detector summary: {str(video.get('analysis_summary') or 'No saved analysis summary.')[:1200]}",
         "",
         f"Persisted event records: {len(events)}",
@@ -58,9 +63,11 @@ def report_lines(video, job, events):
         timestamp_text = format_video_timestamp(event_video_seconds(event)) or "time unavailable"
         score = event.get("model_score", event.get("anomaly_score"))
         confidence = event.get("confidence")
-        score_text = (f"uncalibrated model score {score}" if event.get("event_type") == "SUSPECTED_FIGHTING" and score is not None else
-                      f"anomaly score {score}" if score is not None else
-                      f"confidence {confidence}" if confidence is not None else "score unavailable")
+        score_label = (f"{score:.3f}" if isinstance(score, (int, float)) else _display(score))
+        confidence_label = (f"{confidence:.3f}" if isinstance(confidence, (int, float)) else _display(confidence))
+        score_text = (f"uncalibrated model score {score_label}" if event.get("event_type") == "SUSPECTED_FIGHTING" and score is not None else
+                      f"anomaly score {score_label}" if score is not None else
+                      f"confidence {confidence_label}" if confidence is not None else "score unavailable")
         start = event.get("start_timestamp_seconds")
         end = event.get("end_timestamp_seconds")
         interval_text = (f"Interval: {format_video_timestamp(start)} to {format_video_timestamp(end)}"

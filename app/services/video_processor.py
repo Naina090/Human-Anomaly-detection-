@@ -62,13 +62,40 @@ def _zone_transition_events(pose_frames, zones, width, height, entry_confirmatio
                 key = (str(zone["zone_id"]), normalized_track_id)
                 state = states.setdefault(key, {"phase": "unknown", "last_seen": None,
                     "outside_count": 0, "inside_count": 0, "outside_first": None,
-                    "inside_first": None, "presence_emitted": False})
+                    "inside_first": None, "presence_emitted": False,
+                    "segment_number": 1, "segment_id": f"{normalized_track_id}:s1"})
                 last_seen = state.get("last_seen")
-                if last_seen is not None and (timestamp <= last_seen or timestamp - last_seen > max_track_gap_seconds):
-                    # A stale/reused temporary tracker ID cannot bridge a crossing.
+                if last_seen is not None and timestamp <= last_seen:
+                    # Duplicate/out-of-order sample times cannot establish a
+                    # physical transition and must not reset state as a new ID.
+                    continue
+                if last_seen is not None and timestamp - last_seen > max_track_gap_seconds:
+                    # A stale/reused tracker ID starts a new segment. A missing
+                    # observation is not evidence that the person exited.
+                    previous_segment = state["segment_id"]
+                    previous_phase = state["phase"]
+                    previous_seen = float(last_seen)
+                    state["segment_number"] += 1
+                    state["segment_id"] = f"{normalized_track_id}:s{state['segment_number']}"
                     state.update({"phase": "unknown", "outside_count": 0, "inside_count": 0,
                                   "outside_first": None, "inside_first": None,
                                   "presence_emitted": False})
+                    emitted.append({"event_type": "zone_tracking_gap", "label":
+                        f"Tracking continuity for person track {normalized_track_id} was interrupted in {zone.get('name') or zone['zone_id']}",
+                        "zone_id": str(zone["zone_id"]), "zone_name": zone.get("name") or zone["zone_id"],
+                        "timestamp_seconds": float(timestamp),
+                        "video_timestamp": format_video_timestamp(timestamp),
+                        "frame_number": int(frame_number) if frame_number is not None else None,
+                        "confidence": person.get("detection_confidence"), "anomaly_score": None,
+                        "track_id": normalized_track_id, "track_segment_id": state["segment_id"],
+                        "detection_method": "YOLO pose person box + ByteTrack observation-gap safeguard",
+                        "details": {"previous_track_segment_id": previous_segment,
+                            "previous_zone_phase": previous_phase,
+                            "last_observed_timestamp_seconds": previous_seen,
+                            "resumed_observation_timestamp_seconds": float(timestamp),
+                            "observation_gap_seconds": round(float(timestamp) - previous_seen, 3),
+                            "exit_inferred": False,
+                            "interpretation": "Tracking continuity was unavailable across this observation gap. No exit or re-entry is inferred."}})
                 state["last_seen"] = float(timestamp)
 
                 if location == "boundary":
@@ -87,6 +114,9 @@ def _zone_transition_events(pose_frames, zones, width, height, entry_confirmatio
                     elif event_type == "RESTRICTED_ZONE_ENTRY":
                         label = f"Person track {normalized_track_id} entered restricted zone {zone_name}"
                         interpretation = "Confirmed tracked entry into an enabled polygon; requires human review and does not establish intent or identity."
+                    elif event_type == "zone_tracking_gap":
+                        label = f"Tracking continuity for person track {normalized_track_id} was interrupted in {zone_name}"
+                        interpretation = "Observation gap; no exit, re-entry, identity continuity, or anomaly is inferred."
                     else:
                         label = f"Person track {normalized_track_id} exited zone {zone_name}"
                         interpretation = "Confirmed tracked exit from an enabled polygon; not an anomaly or identity."
@@ -96,6 +126,7 @@ def _zone_transition_events(pose_frames, zones, width, height, entry_confirmatio
                         "boundary_margin_px": boundary_margin_px, "interpretation": interpretation}
                     if transition_details:
                         details.update(transition_details)
+                    details["track_segment_id"] = state["segment_id"]
                     return {"event_type": event_type, "label": label,
                         "zone_id": str(zone["zone_id"]), "zone_name": zone_name,
                         "timestamp_seconds": float(event_timestamp),
@@ -103,6 +134,7 @@ def _zone_transition_events(pose_frames, zones, width, height, entry_confirmatio
                         "frame_number": int(event_frame) if event_frame is not None else None,
                         "confidence": confidence, "anomaly_score": None,
                         "track_id": normalized_track_id,
+                        "track_segment_id": state["segment_id"],
                         "detection_method": "YOLO pose person box + ByteTrack + confirmed polygon crossing",
                         "details": details}
 
@@ -193,15 +225,13 @@ def make_browser_playable_webm(source_path, output_path):
     if os.path.isfile(output_path):
         existing = cv2.VideoCapture(output_path)
         try:
-            ok, frame = existing.read()
-            if ok and frame is not None and getattr(frame, "size", 0):
+            valid, _metadata = _validate_annotated_video(output_path)
+            if valid:
                 return True
         finally:
             existing.release()
-        try:
-            os.remove(output_path)
-        except OSError:
-            return False
+        # Serving a request must never delete or replace a historical output.
+        return False
 
     capture = cv2.VideoCapture(source_path)
     if not capture.isOpened():
@@ -212,7 +242,7 @@ def make_browser_playable_webm(source_path, output_path):
         fps = 25.0
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    temporary_path = output_path[:-5] + "." + uuid.uuid4().hex + ".webm"
+    temporary_path = output_path[:-5] + ".partial-" + uuid.uuid4().hex + ".webm"
     writer = None
     frames = 0
     try:
@@ -249,12 +279,7 @@ def make_browser_playable_webm(source_path, output_path):
             pass
         return False
 
-    verification = cv2.VideoCapture(temporary_path)
-    try:
-        ok, frame = verification.read()
-        valid = bool(ok and frame is not None and getattr(frame, "size", 0))
-    finally:
-        verification.release()
+    valid, _metadata = _validate_annotated_video(temporary_path)
     if not valid:
         try:
             os.remove(temporary_path)
@@ -262,14 +287,177 @@ def make_browser_playable_webm(source_path, output_path):
             pass
         return False
     try:
-        os.replace(temporary_path, output_path)
-        return True
+        published, _reason = _publish_without_overwrite(temporary_path, output_path)
+        return published
     except OSError:
         try:
             os.remove(temporary_path)
         except OSError:
             pass
         return False
+
+
+def make_browser_playable_mp4(source_path, output_path):
+    """Create a finalized H.264/MP4 browser copy without changing the source.
+
+    PyAV's FFmpeg libraries provide the H.264 encoder when available. The
+    conversion is streamed frame-by-frame, uses a fast CPU preset, validates
+    container metadata and decoded frames, and publishes without overwriting
+    an existing artifact. Returns validated metadata, or None on failure.
+    """
+    try:
+        import av
+        from fractions import Fraction
+    except ImportError:
+        return None
+
+    def validate_mp4(path):
+        valid, metadata = _validate_annotated_video(path)
+        if not valid:
+            return None
+        try:
+            container = av.open(path)
+            try:
+                stream = next((item for item in container.streams if item.type == "video"), None)
+                if (stream is None or stream.codec_context.name != "h264"
+                        or container.format.name.split(",")[0] != "mov"):
+                    return None
+                duration = (float(stream.duration * stream.time_base)
+                            if stream.duration is not None and stream.time_base else None)
+                if duration is None or duration <= 0:
+                    return None
+                metadata.update({"codec": "H.264 (libx264)", "container": ".mp4",
+                                 "duration_seconds": duration,
+                                 "frame_count": int(stream.frames or metadata["frame_count"]),
+                                 "fps": float(stream.average_rate or metadata["fps"])})
+                return metadata
+            finally:
+                container.close()
+        except Exception:
+            return None
+
+    if os.path.isfile(output_path):
+        return validate_mp4(output_path)
+    temporary_path = os.path.splitext(output_path)[0] + ".partial-" + uuid.uuid4().hex + ".mp4"
+    source = destination = None
+    try:
+        source = av.open(source_path)
+        input_stream = next((item for item in source.streams if item.type == "video"), None)
+        if input_stream is None:
+            return None
+        fps = input_stream.average_rate or input_stream.base_rate
+        if not fps or float(fps) <= 0:
+            return None
+        rate = Fraction(fps.numerator, fps.denominator)
+        width, height = int(input_stream.width), int(input_stream.height)
+        if width <= 0 or height <= 0:
+            return None
+        destination = av.open(temporary_path, mode="w", format="mp4")
+        try:
+            output_stream = destination.add_stream("libx264", rate=rate)
+        except Exception:
+            return None
+        output_stream.width = width
+        output_stream.height = height
+        output_stream.pix_fmt = "yuv420p"
+        output_stream.options = {"preset": "ultrafast", "crf": "23"}
+        output_stream.codec_context.max_b_frames = 0
+        frame_number = 0
+        for frame in source.decode(input_stream):
+            converted = frame.reformat(width=width, height=height, format="yuv420p")
+            converted.pts = frame_number
+            converted.time_base = Fraction(rate.denominator, rate.numerator)
+            for packet in output_stream.encode(converted):
+                destination.mux(packet)
+            frame_number += 1
+        for packet in output_stream.encode():
+            destination.mux(packet)
+        destination.close()
+        destination = None
+        source.close()
+        source = None
+        if frame_number < 1:
+            return None
+        metadata = validate_mp4(temporary_path)
+        if not metadata or metadata.get("frame_count", 0) < 1:
+            return None
+        published, _reason = _publish_without_overwrite(temporary_path, output_path)
+        if not published:
+            return validate_mp4(output_path)
+        return validate_mp4(output_path)
+    except Exception:
+        return None
+    finally:
+        for container in (source, destination):
+            if container is not None:
+                try:
+                    container.close()
+                except Exception:
+                    pass
+        if os.path.isfile(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+
+def _publish_without_overwrite(temporary_path, output_path):
+    """Atomically publish on the same filesystem without replacing history."""
+    try:
+        # A hard-link create is atomic and fails if another request already
+        # published this name. Both paths are deliberately in PROCESSED_DIR.
+        os.link(temporary_path, output_path)
+    except FileExistsError:
+        return False, "exists"
+    except (OSError, NotImplementedError):
+        return False, "publish_failed"
+    try:
+        os.remove(temporary_path)
+    except OSError:
+        # The final artifact is valid; leaving a private .partial file is safer
+        # than marking a successfully published video unavailable.
+        pass
+    return True, None
+
+
+def _validate_annotated_video(path, expected=None):
+    """Validate a finalized media file and selected frames before publication."""
+    if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+        return False, None
+    capture = cv2.VideoCapture(path)
+    try:
+        if not capture.isOpened():
+            return False, None
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+        count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        duration = count / fps if fps > 0 and count > 0 else 0.0
+        if fps <= 0 or count <= 0 or width <= 0 or height <= 0:
+            return False, None
+        if expected:
+            expected_width, expected_height, expected_frames, expected_fps = expected
+            if ((width, height) != (expected_width, expected_height)
+                    or abs(count - expected_frames) > max(2, int(expected_frames * .02))
+                    or abs(fps - expected_fps) > max(.1, expected_fps * .01)):
+                return False, None
+        decoded = []
+        for frame_index in (0, count // 2, count - 1):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = capture.read()
+            decoded.append(bool(ok and frame is not None and getattr(frame, "size", 0)))
+        if not all(decoded):
+            return False, None
+        extension = os.path.splitext(path)[1].lower()
+        return True, {"container": extension,
+                      "codec": "VP8" if extension == ".webm" else "not identified by OpenCV",
+                      "fps": fps,
+                      "frame_count": count, "width": width, "height": height,
+                      "duration_seconds": duration, "size_bytes": os.path.getsize(path),
+                      "sampled_frames_decoded": decoded}
+    except (OSError, cv2.error, ValueError):
+        return False, None
+    finally:
+        capture.release()
 
 
 def analyze_video(path, sample_seconds, max_duration, detector=None, progress=None, output_path=None,
@@ -320,6 +508,9 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
     last_video_timestamp = None
     writer = None
     annotated = False
+    annotated_output_error = None
+    annotated_output_metadata = None
+    temporary_output_path = None
     try:
         output_max_width = max(0, int(output_max_width or 0))
     except (TypeError, ValueError):
@@ -330,16 +521,18 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
     if (detector is not None or face_detector is not None or object_detector is not None or
             fight_detector is not None or zones) and output_path:
         try:
-            # VP8 in WebM is broadly playable in current browsers. The former
-            # MP4V/FMP4 output decodes in OpenCV but is not supported by many
-            # browser video players, which showed a black player with no frames.
-            writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"VP80"), fps,
+            # VP8 belongs in WebM. Write to a unique temporary WebM and publish
+            # only after final metadata and key-frame validation.
+            temporary_output_path = os.path.splitext(output_path)[0] + ".partial-" + uuid.uuid4().hex + ".webm"
+            writer = cv2.VideoWriter(temporary_output_path, cv2.VideoWriter_fourcc(*"VP80"), fps,
                                      (output_width, output_height))
             if not writer.isOpened():
                 writer.release()
                 writer = None
+                annotated_output_error = "OpenCV could not initialize the VP8/WebM encoder."
         except cv2.error:
             writer = None
+            annotated_output_error = "OpenCV could not initialize the VP8/WebM encoder."
     try:
         while frame_index < frame_count:
             stage_started = time.perf_counter()
@@ -471,30 +664,50 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
                     writer.release()
                     writer = None
                     annotated = False
+                    annotated_output_error = "The annotated video encoder failed while writing frames."
             frame_index += 1
+    except Exception:
+        if temporary_output_path and os.path.isfile(temporary_output_path):
+            try:
+                os.remove(temporary_output_path)
+            except OSError:
+                pass
+        raise
     finally:
         capture.release()
         if writer is not None:
             stage_started = time.perf_counter()
             writer.release()
             profile["annotated_encode_seconds"] += time.perf_counter() - stage_started
-    # A writer can open successfully but still fail to produce a decodable file.
-    # Do not publish a broken annotation link in that case.
+    # A writer can open successfully but still produce an incomplete/corrupt
+    # file. Validate dimensions, FPS, frame count, and first/middle/final frames.
     if annotated and output_path:
         stage_started = time.perf_counter()
-        check = cv2.VideoCapture(output_path)
-        try:
-            output_ok, output_frame = check.read()
-            annotated = bool(output_ok and output_frame is not None and getattr(output_frame, "size", 0))
-        finally:
-            check.release()
-            profile["annotated_output_validation_seconds"] += time.perf_counter() - stage_started
-        if not annotated:
+        annotated, annotated_output_metadata = _validate_annotated_video(
+            temporary_output_path, expected=(output_width, output_height, frame_index, fps))
+        profile["annotated_output_validation_seconds"] += time.perf_counter() - stage_started
+        if annotated:
+            published, reason = _publish_without_overwrite(temporary_output_path, output_path)
+            if not published:
+                annotated = False
+                annotated_output_metadata = None
+                annotated_output_error = ("An annotated file already exists at this path; the historical output was preserved."
+                                          if reason == "exists" else
+                                          "The validated annotated video could not be published safely.")
+        else:
+            annotated = False
+            annotated_output_metadata = None
+            annotated_output_error = "The generated annotated video failed final metadata or frame validation."
+        if not annotated and temporary_output_path and os.path.isfile(temporary_output_path):
             try:
-                import os
-                os.remove(output_path)
+                os.remove(temporary_output_path)
             except OSError:
                 pass
+    elif temporary_output_path and os.path.isfile(temporary_output_path):
+        try:
+            os.remove(temporary_output_path)
+        except OSError:
+            pass
     if read == 0:
         raise VideoError("No readable frames were found in this file.")
     fight_events = []
@@ -550,7 +763,10 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
             if fight_analysis.get("status") == "complete" else "validation_only",
             "analysis_mode": "pose_heuristic" if (detector or pose_frames_sampled or pose_error) else
             "temporal_action" if fight_analysis.get("status") == "complete" else "validation_only",
-            "annotated_output": bool(annotated), "pose_frames": pose_frames,
+            "annotated_output": bool(annotated),
+            "annotated_output_error": annotated_output_error,
+            "annotated_output_metadata": annotated_output_metadata,
+            "pose_frames": pose_frames,
             "pose_analysis": {"status": "failed" if pose_error else ("complete" if pose_frames_sampled else "not_configured"),
                               "method": getattr(detector, "METHOD", "YOLO pose COCO keypoints") if detector else "YOLO pose COCO keypoints",
                               "model_name": getattr(detector, "model_name", None),

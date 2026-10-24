@@ -4,6 +4,7 @@ import os
 import socketserver
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import cv2
 import mongomock
@@ -428,11 +429,51 @@ def test_restart_marks_in_flight_local_alert_uncertain_instead_of_resending(aler
     notification_id = _local_notification(alert_app, video_id)["notification_id"]
     with alert_app.app_context():
         assert claim_video_alert(notification_id)
+        assert update_video_alert(notification_id, {
+            "smtp_transmission_started_at": datetime.now(timezone.utc) - timedelta(hours=1),
+            "last_attempt_at": datetime.now(timezone.utc) - timedelta(hours=1),
+        })
         recover_local_video_alerts()
     saved = _local_notification(alert_app, video_id, notification_id)
     assert saved["status"] == "uncertain"
     with alert_app.app_context():
         assert not list_pending_video_alerts(video_id)
+
+
+def test_restart_safely_requeues_stale_pre_smtp_local_alert(alert_app, tmp_path):
+    _configure_smtp(alert_app, 2525)
+    video_id, _event_id, _ = _local_video(alert_app, tmp_path)
+    notification_id = _local_notification(alert_app, video_id)["notification_id"]
+    with alert_app.app_context():
+        assert claim_video_alert(notification_id)
+        assert update_video_alert(notification_id, {
+            "last_attempt_at": datetime.now(timezone.utc) - timedelta(hours=1),
+        })
+        recover_local_video_alerts(datetime.now(timezone.utc) - timedelta(minutes=10))
+    saved = _local_notification(alert_app, video_id, notification_id)
+    assert saved["status"] == "pending"
+    with alert_app.app_context():
+        assert list_pending_video_alerts(video_id)
+
+
+def test_mongo_alert_recovery_distinguishes_pre_smtp_and_ambiguous_states(alert_app):
+    from datetime import datetime, timedelta, timezone
+    from app.services.repository import recover_video_alerts
+    db = alert_app.extensions["mongo_db"]
+    stale = datetime.now(timezone.utc) - timedelta(hours=1)
+    video_id = db.videos.insert_one({"email_alert_notifications": [
+        {"notification_id": "safe-before-smtp", "status": "sending",
+         "delivery_protocol_version": 2, "last_attempt_at": stale},
+        {"notification_id": "maybe-accepted", "status": "sending",
+         "delivery_protocol_version": 2, "last_attempt_at": stale,
+         "smtp_transmission_started_at": stale},
+        {"notification_id": "legacy-send", "status": "sending", "last_attempt_at": stale},
+    ]}).inserted_id
+    with alert_app.app_context():
+        assert recover_video_alerts(stale_after_seconds=120) == 3
+    alerts = db.videos.find_one({"_id": video_id})["email_alert_notifications"]
+    statuses = {item["notification_id"]: item["status"] for item in alerts}
+    assert statuses == {"safe-before-smtp": "pending", "maybe-accepted": "uncertain", "legacy-send": "uncertain"}
 
 
 def test_mongodb_video_notification_is_atomic_and_excludes_occupancy(alert_app):

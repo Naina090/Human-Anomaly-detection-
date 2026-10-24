@@ -30,7 +30,9 @@ def reports():
         video["status"] = video.get("processing_status")
     for event in events:
         event["video_id"] = str(event["video_id"])
-        event["category"] = event.get("event_type", "Uncategorized")
+        event["category"] = ("Suspected Violence-Related Activity"
+                             if event.get("event_type") == "SUSPECTED_FIGHTING"
+                             else event.get("event_type", "Uncategorized"))
         event["timestamp"] = event_video_seconds(event)
         event["video_timestamp"] = format_video_timestamp(event["timestamp"])
         event["score"] = event.get("model_score", event.get("anomaly_score", event.get("confidence")))
@@ -52,7 +54,9 @@ def reports():
         event["episode_group_id"] = event_groups.get(str(event.get("_id")))
     categories = {}
     for episode in episodes:
-        categories[episode["event_type"]] = categories.get(episode["event_type"], 0) + 1
+        category = ("Suspected Violence-Related Activity" if episode["event_type"] == "SUSPECTED_FIGHTING"
+                    else episode["event_type"])
+        categories[category] = categories.get(category, 0) + 1
     return render_template("reports.html", videos=videos, events=events, start=start, end=end,
                            anomaly_episode_count=len(episodes), episode_categories=categories)
 
@@ -64,7 +68,9 @@ def csv_export():
         abort(400)
     videos, events = report_data(start, end)
     out = io.StringIO(); writer = csv.writer(out)
-    writer.writerow(["video_id", "filename", "uploaded_at", "status", "event_category", "label",
+    writer.writerow(["video_id", "filename", "uploaded_at", "status", "processing_duration_seconds",
+                     "analysis_summary", "pose_status", "pose_model", "fight_status", "fight_model",
+                     "annotated_output_status", "event_category", "label",
                      "timestamp_seconds", "video_timestamp", "start_timestamp_seconds", "end_timestamp_seconds",
                      "event_interval", "episode_group_id", "zone_name", "frame_number", "confidence",
                      "anomaly_score", "model_score", "track_id", "incident_status", "review_notes",
@@ -72,17 +78,27 @@ def csv_export():
     episodes = group_event_episodes(events)
     event_groups = {str(event.get("_id")): episode["group_id"] for episode in episodes
                     for event in episode.get("events", [])}
-    names = {str(v["_id"]): (v.get("original_filename", ""), v.get("upload_date", ""), v.get("processing_status", "")) for v in videos}
+    names = {str(v["_id"]): (v.get("original_filename", ""), v.get("upload_date", ""),
+        v.get("processing_status", ""), v.get("processing_duration", ""),
+        v.get("analysis_summary", ""), (v.get("pose_analysis") or {}).get("status", ""),
+        (v.get("pose_analysis") or {}).get("model_name", ""),
+        (v.get("fight_analysis") or {}).get("status", ""),
+        (v.get("fight_analysis") or {}).get("model_name", ""),
+        v.get("annotated_output_status", "")) for v in videos}
     for e in events:
         event_video_id = str(e["video_id"])
-        filename, uploaded, status = names.get(event_video_id, (e.get("original_filename", ""), "", ""))
+        (filename, uploaded, status, processing_duration, analysis_summary, pose_status,
+         pose_model, fight_status, fight_model, annotated_status) = names.get(
+            event_video_id, (e.get("original_filename", ""), "", "", "", "", "", "", "", "", ""))
         start_seconds, end_seconds = e.get("start_timestamp_seconds"), e.get("end_timestamp_seconds")
         try:
             interval = (f"{format_video_timestamp(float(start_seconds))}-{format_video_timestamp(float(end_seconds))}"
                        if float(start_seconds) >= 0 and float(end_seconds) > float(start_seconds) else "")
         except (TypeError, ValueError):
             interval = ""
-        writer.writerow([event_video_id, filename, uploaded, status, e.get("event_type", ""),
+        writer.writerow([event_video_id, filename, uploaded, status, processing_duration,
+                         analysis_summary, pose_status, pose_model, fight_status, fight_model,
+                         annotated_status, e.get("event_type", ""),
                          e.get("label", ""), event_video_seconds(e) if event_video_seconds(e) is not None else "",
                          format_video_timestamp(event_video_seconds(e)) or "",
                          start_seconds if start_seconds is not None else "",

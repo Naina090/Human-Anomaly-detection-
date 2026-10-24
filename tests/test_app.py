@@ -41,6 +41,7 @@ def app(tmp_path):
         "MONGO_DB_NAME": "test_human_anomaly", "MONGO_PING_ON_STARTUP": False,
         "UPLOAD_DIR": str(tmp_path / "uploads"), "PROCESSED_DIR": str(tmp_path / "processed"),
         "LOCAL_FALLBACK_PATH": str(tmp_path / "local_history.json"),
+        "REQUEST_ERROR_LOG_PATH": str(tmp_path / "sentinel-errors.log"),
         "MAX_CONTENT_LENGTH": 2_000_000, "MAX_DURATION_SECONDS": 30,
         "SAMPLE_EVERY_SECONDS": 0.1, "POSE_MODEL_PATH": "", "OBJECT_MODEL_PATH": "",
         "FIGHT_DETECTION_ENABLED": False, "FIGHT_MODEL_PATH": "",
@@ -48,6 +49,12 @@ def app(tmp_path):
     yield application
     application.extensions["processing_executor"].shutdown(wait=True, cancel_futures=True)
     client.close()
+    error_logger = application.extensions.get("request_error_logger")
+    if error_logger:
+        for handler in list(error_logger.handlers):
+            if getattr(handler, "_sentinel_log_path", None) == os.path.abspath(application.config["REQUEST_ERROR_LOG_PATH"]):
+                error_logger.removeHandler(handler)
+                handler.close()
 
 
 @pytest.fixture()
@@ -120,6 +127,9 @@ def test_app_startup_and_pages_render(client):
     upload = client.get("/upload")
     assert b"Smart Surveillance Zone Configuration" in upload.data
     assert b"roi-canvas" in upload.data and client.get("/static/js/roi.js").status_code == 200
+    assert b"Select a video frame and click Draw Zone" in upload.data
+    assert b"zone-frame-slider" in upload.data and b"Preparing video frame" in upload.data
+    assert b"Finish Polygon" in upload.data and b"Undo Last Point" in upload.data
 
 
 def test_empty_history_shows_real_empty_state(client):
@@ -127,6 +137,47 @@ def test_empty_history_shows_real_empty_state(client):
     assert response.status_code == 200
     assert b"No matching videos" in response.data
     assert b"will appear here" in response.data
+
+
+def test_results_alert_status_is_read_only_and_renders_latest_state(client, app):
+    now = datetime.now(timezone.utc)
+    video_id = app.extensions["mongo_db"].videos.insert_one({
+        "original_filename": "alert-status.mp4", "processing_status": "complete",
+        "upload_date": now, "duration": 10, "email_alert_slots_used": 1,
+        "email_alert_notifications": [{"notification_id": "digest-1", "status": "sent",
+            "sent_at": now, "last_attempt_at": now, "episodes": [
+                {"event_type": "potential_fall", "timestamp_seconds": 4.0}]}],
+    }).inserted_id
+    response = client.get(f"/api/videos/{video_id}/alerts")
+    assert response.status_code == 200
+    assert response.json["sent_count"] == 1 and response.json["maximum"] == 2
+    assert response.json["notifications"][0]["status"] == "sent"
+    page = client.get(f"/results/{video_id}")
+    assert page.status_code == 200
+    assert b"Consolidated video alert" in page.data
+    assert b"Sent" in page.data
+    assert app.extensions["mongo_db"].videos.find_one({"_id": video_id})["email_alert_notifications"][0]["status"] == "sent"
+
+
+def test_alert_status_resumes_only_previously_reserved_stale_pre_smtp_delivery(client, app, monkeypatch):
+    import app.services.notifier as notifier
+    calls = []
+    monkeypatch.setattr(notifier, "schedule_pending_alerts",
+                        lambda _application, identifier: calls.append(str(identifier)))
+    stale = datetime.now(timezone.utc).replace(year=datetime.now(timezone.utc).year - 1)
+    video_id = app.extensions["mongo_db"].videos.insert_one({
+        "original_filename": "already-reserved.mp4", "processing_status": "complete",
+        "email_alert_notifications": [{"notification_id": "reserved-once", "status": "sending",
+            "delivery_protocol_version": 2, "last_attempt_at": stale, "episodes": []}],
+    }).inserted_id
+
+    response = client.get(f"/api/videos/{video_id}/alerts")
+    saved = app.extensions["mongo_db"].videos.find_one({"_id": video_id})
+
+    assert response.status_code == 200
+    assert response.json["notifications"][0]["status"] == "pending"
+    assert calls == [str(video_id)]
+    assert len(saved["email_alert_notifications"]) == 1
 
 
 @pytest.mark.parametrize("status", ["processing", "failed", "complete"])
@@ -255,6 +306,11 @@ def test_analyze_video_route_logs_unexpected_upload_failure_without_exposing_tra
     assert "Traceback (most recent call last)" in caplog.text
     assert "diagnostic-secret" not in caplog.text
     assert "<redacted MongoDB URI>" in caplog.text
+    persisted_log = (tmp_path / "sentinel-errors.log").read_text(encoding="utf-8")
+    assert request_id in persisted_log
+    assert "Traceback (most recent call last)" in persisted_log
+    assert "diagnostic-secret" not in persisted_log
+    assert "<redacted MongoDB URI>" in persisted_log
     assert list((tmp_path / "uploads").iterdir()) == []
 
 
@@ -592,9 +648,30 @@ def test_zone_tracker_ignores_missing_ids_interruptions_and_boundary_jitter():
     assert not [e for e in _zone_transition_events(missing, zones, 100, 100) if e["event_type"] == "RESTRICTED_ZONE_ENTRY"]
     interrupted = [record(0, 10, 20), record(.5, 10, 20), record(3, 35, 45), record(3.5, 35, 45)]
     assert not [e for e in _zone_transition_events(interrupted, zones, 100, 100) if e["event_type"] == "RESTRICTED_ZONE_ENTRY"]
+    assert any(e["event_type"] == "zone_tracking_gap" for e in _zone_transition_events(interrupted, zones, 100, 100))
     jitter = [record(0, 10, 20), record(.5, 10, 20), record(1, 29, 35),
               record(1.5, 35, 45), record(2, 29, 35), record(2.5, 35, 45)]
     assert not [e for e in _zone_transition_events(jitter, zones, 100, 100) if e["event_type"] == "RESTRICTED_ZONE_ENTRY"]
+
+
+def test_zone_tracker_starts_new_segment_after_gap_without_inventing_exit_or_entry():
+    from app.services.video_processor import _zone_transition_events
+    zones = [{"zone_id": "z", "name": "Zone", "enabled": True,
+              "points": [[.3, .3], [.7, .3], [.7, .7], [.3, .7]]}]
+    samples = [{"timestamp_seconds": 0, "frame_number": 0,
+                "people": [{"track_id": 4, "bbox_xyxy": [35, 10, 45, 50], "detection_confidence": .7}]},
+               {"timestamp_seconds": 3, "frame_number": 30,
+                "people": [{"track_id": 4, "bbox_xyxy": [35, 10, 45, 50], "detection_confidence": .8}]},
+               {"timestamp_seconds": 3.5, "frame_number": 35,
+                "people": [{"track_id": 4, "bbox_xyxy": [35, 10, 45, 50], "detection_confidence": .8}]}]
+    events = _zone_transition_events(samples, zones, 100, 100)
+    assert [event["event_type"] for event in events] == [
+        "zone_presence_observed", "zone_tracking_gap", "zone_presence_observed"]
+    assert events[0]["track_segment_id"] == "4:s1"
+    assert events[1]["details"]["previous_track_segment_id"] == "4:s1"
+    assert events[1]["track_segment_id"] == "4:s2"
+    assert events[1]["details"]["exit_inferred"] is False
+    assert not [event for event in events if event["event_type"] in {"zone_exit", "RESTRICTED_ZONE_ENTRY"}]
 
 
 def test_sampled_pose_pipeline_saves_one_neutral_zone_entry_for_occupied_track(tmp_path):
@@ -721,9 +798,116 @@ def test_processed_path_is_restricted_to_generated_name(tmp_path):
     webm_name = "507f1f77bcf86cd799439011_annotated.webm"
     (root / webm_name).write_bytes(b"webm")
     assert safe_processed_path({"processed_filename": webm_name}, str(root)) == str((root / webm_name).resolve())
+    versioned = "507f1f77bcf86cd799439011_annotated_a1b2c3d4.webm"
+    (root / versioned).write_bytes(b"webm")
+    assert safe_processed_path({"processed_filename": versioned}, str(root)) == str((root / versioned).resolve())
     outside = tmp_path / "private.txt"
     outside.write_text("keep")
     assert safe_processed_path({"processed_filename": str(outside)}, str(root)) is None
+
+
+def test_original_mp4_route_has_range_mime_and_missing_file_behavior(client, app, tmp_path):
+    video_id = ObjectId()
+    internal_name = "a" * 32 + ".mp4"
+    upload_path = tmp_path / "uploads" / internal_name
+    upload_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(upload_path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (64, 48))
+    if not writer.isOpened():
+        pytest.skip("OpenCV MP4V test writer is unavailable")
+    for index in range(10):
+        writer.write(np.full((48, 64, 3), index * 18, dtype=np.uint8))
+    writer.release()
+    app.config["UPLOAD_DIR"] = str(upload_path.parent)
+    app.extensions["mongo_db"].videos.insert_one({
+        "_id": video_id, "original_filename": "source-check.mp4",
+        "stored_filename": internal_name, "file_path": internal_name,
+        "processing_status": "complete",
+    })
+
+    response = client.get(f"/media/{video_id}", headers={"Range": "bytes=0-63"})
+    assert response.status_code == 206
+    assert response.mimetype == "video/mp4"
+    assert response.headers["Content-Length"] == "64"
+    assert response.headers["Content-Range"].startswith("bytes 0-63/")
+    assert len(response.data) == 64
+    assert client.get(f"/media/{ObjectId()}").status_code == 404
+
+
+def test_historical_webm_route_keeps_range_playback_and_reports_missing_output(client, app, tmp_path):
+    video_id = ObjectId()
+    source = tmp_path / "legacy-source.mp4"
+    webm = tmp_path / "processed" / f"{video_id}_annotated.webm"
+    webm.parent.mkdir(parents=True, exist_ok=True)
+    make_video(source)
+    assert make_browser_playable_webm(str(source), str(webm))
+    app.config["PROCESSED_DIR"] = str(webm.parent)
+    app.extensions["mongo_db"].videos.insert_one({
+        "_id": video_id, "original_filename": "legacy-source.mp4",
+        "stored_filename": "not-used.mp4", "file_path": "not-used.mp4",
+        "processing_status": "complete", "processed_filename": webm.name,
+    })
+
+    response = client.get(f"/processed/{video_id}", headers={"Range": "bytes=0-63"})
+    assert response.status_code == 206
+    assert response.mimetype in {"video/mp4", "video/webm"}
+    assert response.headers["Content-Length"] == "64"
+    assert response.headers["Content-Range"].startswith("bytes 0-63/")
+    assert webm.exists()  # Historical WebM is preserved; the route serves a compatibility copy.
+    is_h264_copy = response.mimetype == "video/mp4"
+    if is_h264_copy:
+        assert response.data[4:8] == b"ftyp"
+    browser_copy = tmp_path / ("browser-copy.mp4" if is_h264_copy else "browser-copy.webm")
+    full_response = client.get(f"/processed/{video_id}")
+    browser_copy.write_bytes(full_response.data)
+    if is_h264_copy:
+        import av
+        container = av.open(str(browser_copy))
+        stream = container.streams.video[0]
+        frames = list(container.decode(stream))
+        assert stream.codec_context.name == "h264"
+        assert stream.duration * stream.time_base == pytest.approx(1.0, abs=.1)
+        assert len(frames) == 10
+        container.close()
+    assert client.get(f"/processed/{ObjectId()}").status_code == 404
+
+
+def test_results_layout_contains_balanced_media_and_scrollable_evidence(client, app):
+    video_id = app.extensions["mongo_db"].videos.insert_one(
+        video_doc("layout-check.mp4", "complete")).inserted_id
+    app.extensions["mongo_db"].detection_events.insert_one({
+        "video_id": video_id, "event_type": "potential_fall", "label": "review candidate",
+        "timestamp_seconds": 1.5, "details": {},
+    })
+    page = client.get(f"/results/{video_id}")
+    css = client.get("/static/css/style.css").data
+    js = client.get("/static/js/results.js").data
+    assert page.status_code == 200
+    assert b'class="result-media-grid"' in page.data
+    assert b'class="panel analysis-summary-panel"' in page.data
+    assert b'class="timeline-table"' in page.data
+    assert b"grid-template-columns:repeat(2,minmax(0,1fr))" in css
+    assert b"@media(max-width:820px)" in css
+    assert b".player-retry[hidden]{display:none!important}" in css
+    assert b"overflow-x:auto" in css and b"min-width:1120px" in css
+    assert b"loadeddata" in js
+    assert b"video.error" in js and b"video.load()" in js
+    assert b"addEventListener('stalled'" in js and b"false);" in js
+    assert b"stateVersion" in js and b"browserMessage" in js
+    assert b"data-seconds" in page.data
+
+
+def test_annotated_publish_never_overwrites_an_existing_artifact(tmp_path):
+    from app.services.video_processor import _publish_without_overwrite
+    temporary = tmp_path / "partial.webm"
+    target = tmp_path / "saved.webm"
+    temporary.write_bytes(b"new validated output")
+    target.write_bytes(b"historical output")
+
+    published, reason = _publish_without_overwrite(str(temporary), str(target))
+
+    assert not published and reason == "exists"
+    assert target.read_bytes() == b"historical output"
+    assert temporary.exists()
 
 
 def test_legacy_mp4v_result_is_converted_to_browser_playable_webm(client, app, tmp_path):
@@ -864,20 +1048,39 @@ def test_upload_saves_processing_result_and_database_error_cleanup(client, app, 
     assert download.status_code == 200 and download.data == payload
     assert "attachment" in download.headers["Content-Disposition"]
     assert saved.get("processed_filename")
-    assert saved["processed_filename"].endswith("_annotated.webm")
+    assert saved["processed_filename"].endswith(("_annotated.mp4", "_annotated.webm"))
     annotated = client.get(f"/processed/{video_id}")
     annotated_download = client.get(f"/processed/{video_id}/download")
     assert annotated.status_code == 200 and annotated.data
     assert annotated.data != original.data
-    assert annotated.mimetype == "video/webm"
+    assert annotated.mimetype in {"video/mp4", "video/webm"}
+    assert saved["annotated_output_status"] == "ready"
+    output_metadata = saved["annotated_output_metadata"]
+    assert output_metadata["container"] in {".mp4", ".webm"}
+    if output_metadata["container"] == ".mp4":
+        assert "H.264" in output_metadata["codec"]
+    assert output_metadata["frame_count"] == 10
+    assert output_metadata["duration_seconds"] == pytest.approx(1.0, abs=.1)
+    assert output_metadata["width"] == 64 and output_metadata["height"] == 48
+    assert output_metadata["sampled_frames_decoded"] == [True, True, True]
+    byte_range = client.get(f"/processed/{video_id}", headers={"Range": "bytes=0-31"})
+    assert byte_range.status_code == 206
+    assert byte_range.headers["Content-Range"].startswith("bytes 0-31/")
+    assert len(byte_range.data) == 32
+    assert byte_range.mimetype == annotated.mimetype
     # Verify that the exact streamed result is a decodable video, not an empty
     # container that would render as the browser's black video player.
-    annotated_path = tmp_path / "served-annotated.webm"
+    annotated_path = tmp_path / "served-annotated.mp4"
     annotated_path.write_bytes(annotated.data)
     decoded = cv2.VideoCapture(str(annotated_path))
-    ok, frame = decoded.read()
+    count = int(decoded.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames_ok = []
+    for position in (0, count // 2, max(0, count - 1)):
+        decoded.set(cv2.CAP_PROP_POS_FRAMES, position)
+        ok, frame = decoded.read()
+        frames_ok.append(bool(ok and frame is not None and frame.size > 0))
     decoded.release()
-    assert ok and frame is not None and frame.size > 0
+    assert frames_ok == [True, True, True]
     assert annotated_download.status_code == 200
     assert "attachment" in annotated_download.headers["Content-Disposition"]
     assert app.extensions["mongo_db"].face_detection_frames.count_documents({"video_id": ObjectId(video_id)}) > 0
@@ -1046,7 +1249,8 @@ def test_mocked_fighting_candidate_persists_to_results_history_dashboard_and_rep
         {"video_id": ObjectId(video_id), "event_type": "SUSPECTED_FIGHTING"})
     assert saved and saved["model_score"] == .73
     result_page = client.get(response.location)
-    assert b"Fighting detection" in result_page.data
+    assert b"Suspected Violence-Related Activity" in result_page.data
+    assert b"0.730 uncalibrated model score" in result_page.data
     assert b"Mock candidate for test only" in result_page.data
     assert b"00:00.20" in result_page.data and b"00:00.80" in result_page.data
     video_csv = client.get(f"/results/{video_id}/report.csv")

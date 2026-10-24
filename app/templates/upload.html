@@ -4,8 +4,13 @@
 <label class="dropzone" for="video"><span class="upload-icon">⇧</span><strong>Drop a video here</strong><span>or browse from this device</span><span class="button secondary">Choose video</span><small>MP4 · AVI · MOV · MKV · Up to {{ max_mb }} MB</small><input id="video" type="file" name="video" accept="video/mp4,video/avi,video/quicktime,video/x-matroska,.mp4,.avi,.mov,.mkv" required></label>
 <div id="preview-wrap" class="preview-wrap" hidden><video id="preview" controls></video><span id="file-name"></span><span id="file-size"></span></div>
 <section id="zone-config" class="zone-config" aria-labelledby="zone-heading">
-  <div class="zone-heading"><div><h2 id="zone-heading">Smart Surveillance Zone Configuration</h2><p>Optional. Draw on the first video frame; coordinates are saved relative to the original frame.</p></div><label class="zone-toggle"><input id="zone-enabled" type="checkbox" checked> Enable zones</label></div>
-  <div class="zone-stage-wrap" hidden><canvas id="roi-canvas" class="roi-canvas" aria-label="First video frame and polygon drawing layer"></canvas><p id="zone-hint" class="fine-print">Choose “Draw Zone”, then click at least three points.</p></div>
+  <div class="zone-heading"><div><h2 id="zone-heading">Smart Surveillance Zone Configuration</h2><p>Select a video frame and click Draw Zone. Click at least 3 points around the restricted area, then Finish Polygon.</p></div><label class="zone-toggle"><input id="zone-enabled" type="checkbox" checked> Enable zones</label></div>
+  <div class="zone-stage-wrap" hidden>
+    <p id="zone-frame-status" class="zone-frame-status" role="status" aria-live="polite">Preparing video frame...</p>
+    <canvas id="roi-canvas" class="roi-canvas" aria-label="Selected video frame and polygon drawing layer"></canvas>
+    <label id="zone-frame-control" class="zone-frame-control" for="zone-frame-slider" hidden>Choose frame <input id="zone-frame-slider" type="range" min="0" max="0" step="0.1" value="0" disabled><output id="zone-frame-time" for="zone-frame-slider">00:00.0</output></label>
+    <p id="zone-hint" class="fine-print" role="status" aria-live="polite">Loading a decoded frame from the selected video...</p>
+  </div>
   <div class="zone-controls"><label class="zone-name-label" for="zone-name">Zone name<input id="zone-name" type="text" value="Restricted Area" maxlength="80"></label><div class="zone-buttons"><button class="button secondary" id="zone-draw" type="button">Draw Zone</button><button class="button secondary" id="zone-finish" type="button" disabled>Finish Polygon</button><button class="button quiet" id="zone-undo" type="button" disabled>Undo Last Point</button><button class="button quiet" id="zone-clear" type="button" disabled>Clear Zone</button></div></div>
   <ul id="zone-list" class="zone-list" aria-live="polite"></ul>
   <p class="zone-limit-note">Spatial anomaly matching is available only when the configured pose detector produces a person bounding box. Without that location, zones are saved but events are not assigned to a zone.</p>

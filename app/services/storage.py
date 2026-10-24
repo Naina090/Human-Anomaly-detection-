@@ -24,7 +24,8 @@ def safe_video_path(video, upload_dir):
 def safe_processed_path(video, processed_dir):
     name = video.get("processed_filename")
     # Accept legacy MP4 results as well as new browser-compatible VP8/WebM files.
-    if not isinstance(name, str) or not re.fullmatch(r"[0-9a-f]{24}_annotated\.(?:mp4|webm)", name):
+    if not isinstance(name, str) or not re.fullmatch(
+            r"[0-9a-f]{24}_annotated(?:_[0-9a-f]{8})?\.(?:mp4|webm)", name):
         return None
     root = os.path.realpath(processed_dir)
     target = os.path.realpath(os.path.join(root, name))

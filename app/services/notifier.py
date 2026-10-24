@@ -343,6 +343,10 @@ def _deliver_one(app, notification_id):
                 subject, html_body, text_body = _notification_bodies(video, claimed)
                 msg = _message(app.config, subject, html_body, text_body, gif_path,
                                notification_id.replace("-", "")[:32])
+                transmission_marked = update_video_alert(notification_id, {
+                    "smtp_transmission_started_at": datetime.now(timezone.utc)})
+                if not transmission_marked:
+                    raise RuntimeError("The durable SMTP transmission marker could not be saved; message was not sent.")
                 smtp_started = time.perf_counter()
                 def mark_transmission():
                     nonlocal transmission_started

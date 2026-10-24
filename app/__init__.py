@@ -1,6 +1,7 @@
 import os
 import secrets
 import logging
+from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor
 from threading import BoundedSemaphore
 from flask import Flask, render_template, session, request, abort, g
@@ -11,6 +12,25 @@ from .logging_utils import sanitized_traceback
 from .routes import register_routes
 
 
+def _configure_request_error_log(app):
+    """Persist sanitized unexpected-request tracebacks so closed terminals do not erase them."""
+    path = app.config.get("REQUEST_ERROR_LOG_PATH")
+    if not path and app.config.get("TESTING"):
+        return None
+    path = path or os.path.join(app.instance_path, "sentinel-errors.log")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    logger = logging.getLogger("sentinel.request_errors")
+    logger.setLevel(logging.ERROR)
+    logger.propagate = False
+    if not any(getattr(handler, "_sentinel_log_path", None) == os.path.abspath(path)
+               for handler in logger.handlers):
+        handler = RotatingFileHandler(path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        handler._sentinel_log_path = os.path.abspath(path)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+    return logger
+
+
 def create_app(test_config=None):
     app = Flask(__name__)
     app.config.from_object(Config)
@@ -19,6 +39,7 @@ def create_app(test_config=None):
     app.config["TEMPLATES_AUTO_RELOAD"] = True
     if test_config:
         app.config.update(test_config)
+    app.extensions["request_error_logger"] = _configure_request_error_log(app)
     # A test app must never inherit a developer's live SMTP settings from .env.
     # Individual notifier tests can explicitly enable delivery to a loopback sink.
     if app.config.get("TESTING") and not (test_config and "EMAIL_ALERTS_ENABLED" in test_config):
@@ -139,10 +160,19 @@ def create_app(test_config=None):
         # Log the full server-side traceback for diagnosis, but never include the
         # request body, uploaded content, query string, or MongoDB credentials.
         formatted = sanitized_traceback(error, app.config)
+        request_id = getattr(g, "request_id", "unknown")
+        diagnostic = (
+            "Unhandled request exception request_id=%s method=%s path=%s endpoint=%s exception=%s; "
+            "sanitized traceback follows:\n%s"
+        ) % (request_id, request.method, request.path, request.endpoint or "unknown",
+             type(error).__name__, formatted)
         app.logger.error(
             "Unhandled request exception request_id=%s (%s) at endpoint %s; traceback follows:\n%s",
-            getattr(g, "request_id", "unknown"), type(error).__name__, request.endpoint or "unknown", formatted,
+            request_id, type(error).__name__, request.endpoint or "unknown", formatted,
         )
+        error_logger = app.extensions.get("request_error_logger")
+        if error_logger:
+            error_logger.error(diagnostic)
         return render_template(
             "error.html",
             message="The server could not complete this request. Share the reference below with your project support person.",
