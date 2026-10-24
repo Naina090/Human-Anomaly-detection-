@@ -64,7 +64,7 @@ Install PyTorch using the current command recommended by the [official PyTorch i
 python -m pip install -r requirements-ai.txt
 ```
 
-Obtain the documented pretrained `yolo26n-pose.pt` pose weights from the Ultralytics Pose task using a source and license you have reviewed. Set `POSE_MODEL_PATH` in `.env` to the local weights file. No model is automatically downloaded. If pose weights or dependencies are unavailable, that stage is marked unavailable while video validation and independently available analyses continue. When configured, sampled COCO shoulder, hip, knee, and ankle coordinates and model confidence values are stored by frame in `pose_detection_frames`; the Results page links sampled pose times to the source player. Fall candidates remain a separate heuristic event type.
+Obtain the documented pretrained `yolo26n-pose.pt` pose weights from the Ultralytics Pose task using a source and license you have reviewed. Set `POSE_MODEL_PATH` in `.env` to the local weights file. No model is automatically downloaded. If pose weights or dependencies are unavailable, that stage is marked unavailable while video validation and independently available analyses continue. When configured, the pose model runs Ultralytics tracking with `persist=True` and `POSE_TRACKER` (default `bytetrack.yaml`) on the sampled frames. COCO shoulder, hip, knee, and ankle keypoints, detected person boxes, actual box confidence, and temporary track IDs are stored by frame in `pose_detection_frames`; Results links sampled pose times to the source player and displays approximate track counts. A fresh model/tracker is created per video job. Polygon occupancy emits separate `zone_entry`/`zone_exit` records only when a real track ID and person box are available; these are not anomaly events. Fall candidates remain a separate temporal heuristic event type.
 
 The fall transition rule requires previously upright torso evidence, a configurable rapid vertical drop, and configurable sustained horizontal torso evidence. It records candidate start/end timestamps, component evidence, model name/version, and review score. Tune `FALL_TRANSITION_WINDOW_SECONDS`, `FALL_MIN_VERTICAL_DROP`, `FALL_MIN_HORIZONTAL_PERSISTENCE`, and `FALL_CANDIDATE_SCORE_THRESHOLD` in `.env`; these settings are experimental and are not accuracy guarantees.
 
@@ -99,10 +99,12 @@ Open http://127.0.0.1:5000. If PowerShell blocks virtual-environment activation,
 | `SECRET_KEY` | generated per process if omitted | Flask session signature; set a stable private value |
 | `MAX_UPLOAD_MB` | 250 | Maximum request size |
 | `MAX_DURATION_SECONDS` | 900 | Maximum clip duration |
+| `ANNOTATED_OUTPUT_MAX_WIDTH` | 640 | Maximum width of the generated preview; detector inference still uses original-resolution source frames |
 | `SAMPLE_EVERY_SECONDS` | 1.0 | Frame inference sampling interval |
 | `PROCESSING_WORKERS` | 1 | Concurrent jobs in this Flask process |
 | `PROCESSING_QUEUE_SIZE` | 3 | Additional queued jobs |
 | `POSE_MODEL_PATH` | unset | Optional local pose weight path |
+| `POSE_TRACKER` | `bytetrack.yaml` | Ultralytics tracker for person IDs on sampled pose frames |
 | `FALL_TRANSITION_WINDOW_SECONDS` | 1.5 | Maximum time gap for rapid-drop evidence |
 | `FALL_MIN_VERTICAL_DROP` | 0.12 | Minimum drop as a fraction of frame height |
 | `FALL_MIN_HORIZONTAL_PERSISTENCE` | 0.6 | Required horizontal torso duration in seconds |
@@ -173,6 +175,19 @@ By default, `FACE_CASCADE_PATH` is empty and the app uses the cascade path provi
 On application startup, persisted jobs left queued or running by a previous local Flask process are marked `interrupted`, with the same status applied to their video records. History and Results provide a retry action for failed/interrupted videos if the original file still exists. Retry claims the video with a conditional MongoDB update so repeated requests cannot start two workers for the same record. Partial results from earlier attempts are retained in MongoDB with `superseded: true` and excluded from current result pages and analytics. This recovery assumes a single local Flask worker process; this in-process queue is not a distributed multi-server job system.
 
 Existing video documents need no destructive migration. Older records without `file_size` or `face_analysis` remain viewable and show a not-run/unknown face state. The app creates an index for `face_detection_frames` at startup. Face frame records are removed when their owning video is deleted.
-#   H u m a n - A n o m a l y - d e t e c t i o n -  
- #   H u m a n - A n o m a l y - d e t e c t i o n -  
+#   H u m a n - A n o m a l y - d e t e c t i o n - 
  
+ #   H u m a n - A n o m a l y - d e t e c t i o n - 
+ 
+ 
+
+## Optional polygon surveillance zones
+
+On **Analyze video**, select a clip, wait for the first-frame preview, then choose **Draw Zone** and click at least three points. **Finish Polygon** or click near the first point to close it. You can add multiple zones, rename them before drawing, disable all zones for the upload, undo, or clear them. The browser sends normalized frame coordinates (each x/y value is between 0 and 1); the server validates and saves the polygons with the video record. Generated annotated output may show translucent zone overlays; the uploaded source is never modified.
+
+Zone-specific fall-candidate association runs only when a configured pose model emits a candidate and its result includes the selected person's bounding box. The documented test point is that box's bottom center, checked against each enabled polygon using OpenCV. A point inside a polygon is labelled **Inside active zone**; a localized candidate outside is labelled **Outside active zones**. With no pose model, or if a candidate has no usable person location, the application reports that zone association is unavailable and does not infer a location from face or generic object detections. Polygon setup does not add anomaly predictions by itself.
+
+## Optional suspected-fighting review analysis
+
+The optional X3D-M temporal Violence / Non-Violence classifier setup, model limitations, source, licensing notes, frame sampling, configuration, and troubleshooting are documented in [docs/FIGHT_DETECTION.md](docs/FIGHT_DETECTION.md). Install its optional dependencies with `.venv\Scripts\python.exe -m pip install -r requirements-ai.txt`. The detector does not identify individuals or associate clip-level results with polygon zones.
+

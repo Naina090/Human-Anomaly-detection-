@@ -1,3 +1,6 @@
 # Optional pose-model runtime. Install after requirements.txt and verify
 # PyTorch's CPU/CUDA wheel for your hardware using the official PyTorch selector.
 ultralytics>=8.4,<9
+lap>=0.5.12  # Required by Ultralytics ByteTrack's linear assignment step.
+# Temporal X3D-M violence-activity inference (keeps the project's existing Torch/CUDA build).
+pytorchvideo==0.1.5

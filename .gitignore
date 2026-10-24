@@ -3,8 +3,11 @@ __pycache__/
 .pytest_cache/
 .pytest-temp/
 .env
+instance/
 instance/*.db
 instance/*.sqlite*
+instance/local_history.json
+instance/alert_evidence/
 *.pt
 *.onnx
 *.log

@@ -8,13 +8,16 @@
     <div class="system-status-item"><span class="status-indicator {{ 'online' if mongo_connected else 'offline' }}"></span><div><b>MongoDB</b><small>{{ 'Connected' if mongo_connected else 'Unavailable · check .env and MongoDB access' }}</small></div></div>
     <div class="system-status-item"><span class="status-indicator {{ 'online' if detector.ready else 'limited' }}"></span><div><b>Pose analysis</b><small>{{ detector.message }}</small></div></div>
     <div class="system-status-item"><span class="status-indicator {{ 'online' if object_detector.ready else 'limited' }}"></span><div><b>Object detection / tracking</b><small>{{ object_detector.message }}</small></div></div>
+    <div class="system-status-item"><span class="status-indicator {{ 'online' if fight_detector.ready else 'limited' }}"></span><div><b>Temporal fighting review</b><small>{{ fight_detector.message }}</small></div></div>
   </section>
 
   <div class="metric-grid">
     <div class="metric"><span>VIDEOS UPLOADED</span><strong>{{ videos }}</strong><small>All recorded analysis attempts</small></div>
     <div class="metric"><span>POTENTIAL EVENTS</span><strong>{{ events }}</strong><small>Actual stored detector events</small></div>
+    <div class="metric"><span>RESTRICTED-ZONE ENTRIES</span><strong>{{ restricted_zone_entries }}</strong><small>Confirmed outside-to-inside track transitions; review required</small></div>
+    <div class="metric"><span>SUSPECTED FIGHTING CANDIDATES</span><strong>{{ suspected_fighting_events }}</strong><small>Persisted temporal-model review events; not confirmed incidents</small></div>
     <div class="metric"><span>COMPLETED</span><strong>{{ done }}</strong><small>Processing completed</small></div>
-    <div class="metric"><span>ACTIVE JOBS</span><strong>{{ active }}</strong><small>Queued or running</small></div>
+    <div class="metric"><span>ACTIVE / WAITING</span><strong>{{ active }}</strong><small>Queued, running, or waiting for MongoDB</small></div>
     <div class="metric"><span>QUEUED</span><strong>{{ queued }}</strong><small>Waiting for a worker</small></div>
     <div class="metric"><span>PROCESSING</span><strong>{{ processing }}</strong><small>Currently in the worker</small></div>
     <div class="metric"><span>FAILED RUNS</span><strong>{{ failed }}</strong><small>Processing errors recorded</small></div>

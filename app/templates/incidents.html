@@ -1,0 +1,17 @@
+{% extends 'base.html' %}
+{% block title %}Incident review | Sentinel{% endblock %}
+{% block content %}
+<div class="wrap page">
+  <div class="page-heading"><div><div class="eyebrow">REVIEW / 05</div><h1>Incident review</h1><p>Candidate events are review signals and need human assessment. This local demo has no user accounts.</p></div></div>
+  <form class="filters" method="get">
+    <label>Status <select name="status"><option value="">All statuses</option>{% for value in ['new','reviewing','resolved','false_positive'] %}<option value="{{ value }}" {% if status == value %}selected{% endif %}>{{ value|replace('_',' ')|title }}</option>{% endfor %}</select></label>
+    <label>From <input type="date" name="start" value="{{ start }}"></label><label>To <input type="date" name="end" value="{{ end }}"></label><button class="button secondary">Filter</button>
+  </form>
+  {% if incidents %}<div class="table-wrap"><table><thead><tr><th>Video</th><th>Event</th><th>Time</th><th>Score</th><th>Email alert</th><th>Status / notes</th></tr></thead><tbody>
+    {% for item in incidents %}<tr><td><a href="{{ url_for('videos.results',video_id=item.video_id_text) }}#event-{{ item.id }}">{{ item.filename }}</a></td><td>{{ item.label or item.event_type|replace('_',' ')|title }}</td><td>{% if item.video_timestamp_label %}<a href="{{ url_for('videos.results',video_id=item.video_id_text) }}#event-{{ item.id }}">{{ item.video_timestamp_label }}</a>{% else %}Time unavailable in this saved event{% endif %}</td><td>{% if item.get('model_score') is not none %}{{ '%.3f'|format(item.get('model_score')) }} model score (uncalibrated){% elif item.anomaly_score is not none %}{{ item.anomaly_score }}{% else %}—{% endif %}</td><td>{{ item.email_delivery_status|replace('_',' ')|title }}{% if item.email_delivery_failure %}<small>{{ item.email_delivery_failure }}</small>{% endif %}</td><td>
+      <form method="post" action="{{ url_for('incidents.review',event_id=item.id) }}" class="incident-review"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ request.full_path }}"><select name="status" aria-label="Incident status">{% for value in ['new','reviewing','resolved','false_positive'] %}<option value="{{ value }}" {% if item.incident_status == value %}selected{% endif %}>{{ value|replace('_',' ')|title }}</option>{% endfor %}</select><textarea name="review_notes" maxlength="4000" rows="2" aria-label="Review notes" placeholder="Review notes">{{ item.review_notes or '' }}</textarea><button class="button secondary">Save review</button></form>
+    </td></tr>{% endfor %}
+  </tbody></table></div>{% else %}<div class="empty"><h3>No incident records to review</h3><p>Persisted anomaly candidate events appear here after a detector produces them. Object detections are not incidents.</p></div>{% endif %}
+  <p class="fine-print">Review changes are CSRF-protected and limited to requests from this computer. The application has no login or per-user authorization; do not expose it as a multi-user service.</p>
+</div>
+{% endblock %}

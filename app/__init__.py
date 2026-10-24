@@ -19,6 +19,10 @@ def create_app(test_config=None):
     app.config["TEMPLATES_AUTO_RELOAD"] = True
     if test_config:
         app.config.update(test_config)
+    # A test app must never inherit a developer's live SMTP settings from .env.
+    # Individual notifier tests can explicitly enable delivery to a loopback sink.
+    if app.config.get("TESTING") and not (test_config and "EMAIL_ALERTS_ENABLED" in test_config):
+        app.config["EMAIL_ALERTS_ENABLED"] = False
     os.makedirs(app.config["UPLOAD_DIR"], exist_ok=True)
     os.makedirs(app.config["PROCESSED_DIR"], exist_ok=True)
     init_database(app)
@@ -32,7 +36,51 @@ def create_app(test_config=None):
     workers = max(1, int(app.config.get("PROCESSING_WORKERS", 1)))
     app.extensions["processing_executor"] = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="video-analysis")
     app.extensions["processing_slots"] = BoundedSemaphore(workers + max(0, int(app.config.get("PROCESSING_QUEUE_SIZE", 3))))
+    app.extensions["alert_executor"] = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sentinel-email-alert")
+    app.extensions["alert_futures"] = {}
     register_routes(app)
+
+    # The local JSON fallback survives a Flask restart, but an executor thread
+    # does not. Resume queued/legacy waiting records after routes and the worker
+    # pool exist; mark jobs interrupted by the previous process explicitly.
+    # Flask's debug reloader imports the app once in its watcher process and
+    # again in the serving process. Only the serving child may recover jobs or
+    # schedule durable alerts, otherwise the watcher can mark live jobs
+    # interrupted or start a competing worker.
+    reloader_parent = (app.config.get("DEBUG") and
+                       os.environ.get("WERKZEUG_RUN_MAIN", "").lower() != "true")
+    if not app.config.get("TESTING") and not reloader_parent:
+        try:
+            from app.services.local_fallback import prepare_local_jobs_on_startup, fail_pending_video
+            from app.services.storage import safe_video_path
+            from app.services.repository import get_video
+            from app.routes.videos import _run_analysis
+            with app.app_context():
+                local_jobs = prepare_local_jobs_on_startup()
+                for item in local_jobs:
+                    video_id, job_id = item["video_id"], item["job_id"]
+                    video = get_video(video_id)
+                    path = safe_video_path(video, app.config["UPLOAD_DIR"]) if video else None
+                    if not path:
+                        fail_pending_video(video_id, "The local upload file is missing or outside the upload folder; this job cannot run.")
+                        continue
+                    if not app.extensions["processing_slots"].acquire(blocking=False):
+                        fail_pending_video(video_id, "The local processing queue is full. Retry this video after another job finishes.")
+                        continue
+                    try:
+                        app.extensions["processing_executor"].submit(_run_analysis, app, video_id, job_id, path)
+                    except RuntimeError:
+                        app.extensions["processing_slots"].release()
+                        fail_pending_video(video_id, "The local worker could not start. Restart Flask and retry this video.")
+        except Exception as exc:
+            logging.getLogger(__name__).exception(
+                "Local fallback worker recovery failed (%s). Existing JSON records were preserved.",
+                type(exc).__name__,
+            )
+        # Alert delivery has its own single-thread worker and durable status on
+        # the saved event. A restart requeues interrupted SMTP attempts.
+        from app.services.notifier import recover_and_schedule_alerts
+        recover_and_schedule_alerts(app)
 
     @app.before_request
     def assign_request_id():
@@ -59,8 +107,12 @@ def create_app(test_config=None):
     @app.context_processor
     def csrf_context():
         model_path = app.config.get("POSE_MODEL_PATH", "")
+        from app.services.notifier import smtp_configuration
+        alert_ready, alert_reason = smtp_configuration(app.config)
         return {"csrf_token": session["csrf_token"],
-                "detector_configured": bool(model_path and os.path.isfile(model_path))}
+                "detector_configured": bool(model_path and os.path.isfile(model_path)),
+                "email_alerts_ready": alert_ready,
+                "email_alerts_message": alert_reason}
 
     @app.errorhandler(404)
     def not_found(_error):

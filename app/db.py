@@ -1,5 +1,7 @@
 """Application-scoped MongoDB connection and index setup."""
 import logging
+import re
+import time
 from urllib.parse import unquote
 from flask import current_app
 from pymongo import MongoClient
@@ -23,19 +25,29 @@ def _friendly_connection_error(error):
     if isinstance(error, ConfigurationError):
         detail = str(error).lower()
         if "dns" in detail or "resolution" in detail:
+            resolver_match = re.search(r"Server Do53:([^@\s]+)@53", str(error))
+            resolver_hint = (f" Python's DNS query to resolver {resolver_match.group(1)} timed out."
+                             if resolver_match else " Python's DNS query timed out.")
             return ("PyMongo could not resolve the MongoDB Atlas DNS address. If PowerShell resolves SRV records but Python times out, "
-                    "check the DNS resolver used by the active Python environment and confirm every SRV target resolves. "
-                    "Keep the Atlas URI and TLS settings unchanged.")
+                    + resolver_hint + " Ask your network administrator to allow Python DNS SRV/TXT lookups (UDP/TCP port 53) "
+                    "or configure the adapter to use an approved DNS resolver. Keep the Atlas URI and TLS settings unchanged.")
         return "MongoDB connection settings could not be parsed. Check the URI copied from Atlas and URL-encode special password characters."
     if isinstance(error, OperationFailure):
         code = getattr(error, "code", None)
         detail = str(error).lower()
+        if code == 40:
+            return ("MongoDB rejected an update because the same document path was included more than once. "
+                    "This is an application update conflict, not a network or permission failure.")
         if code == 18 or "authentication failed" in detail or "bad auth" in detail:
             return "MongoDB authentication failed (code 18). Check the Atlas Database Access username/password and URL-encode password special characters."
         if code == 13 or "not authorized" in detail or "unauthorized" in detail:
             return "MongoDB authenticated the user but denied permission (code 13). Grant the Atlas database user readWrite on the configured database; startup also needs permission to create indexes."
         return "MongoDB returned an operation failure (code {}). Check the Atlas database user's roles and connection settings.".format(code or "unknown")
     if isinstance(error, ServerSelectionTimeoutError):
+        detail = str(error).lower()
+        if "replicasetnoprimary" in detail or "no primary" in detail:
+            return ("MongoDB server selection timed out because no Atlas replica-set primary responded. "
+                    "Check that the Atlas cluster is running, its Network Access list allows this computer, and outbound MongoDB traffic is permitted.")
         return "MongoDB is unavailable. Check Atlas Network Access, internet connectivity, and that the cluster is running."
     return "MongoDB is unavailable. Check the Atlas URI, network access, and database credentials."
 
@@ -43,6 +55,7 @@ def _friendly_connection_error(error):
 def init_database(app):
     app.extensions["mongo_error"] = None
     app.extensions["mongo_ping_ok"] = False
+    app.extensions["mongo_retry_at"] = 0.0
     try:
         client = app.config.get("MONGO_CLIENT")
         uri = (app.config.get("MONGO_URI") or "").strip()
@@ -51,6 +64,8 @@ def init_database(app):
             app.extensions["mongo_client"] = None
             app.extensions["mongo_db"] = None
             app.extensions["mongo_available"] = False
+            app.extensions["mongo_retry_at"] = time.monotonic() + max(
+                0.0, float(app.config.get("MONGO_RETRY_INTERVAL_SECONDS", 5)))
             app.extensions["mongo_error"] = (
                 "MongoDB is not configured. Open the .env file beside app.py and replace the value after "
                 "MONGO_URI= with the connection string copied from MongoDB Atlas. Keep it private."
@@ -70,6 +85,8 @@ def init_database(app):
         app.extensions["mongo_db"] = None
         app.extensions["mongo_available"] = False
         app.extensions["mongo_error"] = _friendly_connection_error(exc)
+        app.extensions["mongo_retry_at"] = time.monotonic() + max(
+            0.0, float(app.config.get("MONGO_RETRY_INTERVAL_SECONDS", 5)))
         log.warning("MongoDB configuration is unavailable (%s, code=%s): %s",
                     type(exc).__name__, getattr(exc, "code", None), app.extensions["mongo_error"])
         log.error("MongoDB client initialization traceback (credentials redacted):\n%s",
@@ -87,9 +104,13 @@ def init_database(app):
         db.videos.create_index("upload_date", name="videos_upload_date")
         db.videos.create_index("processing_status", name="videos_status")
         db.videos.create_index([("original_filename", 1), ("upload_date", -1)], name="videos_filename_date")
+        db.videos.create_index("email_alert_notifications.status", name="videos_email_alert_status")
         db.detection_events.create_index("video_id", name="events_video_id")
         db.detection_events.create_index("created_at", name="events_created_at")
         db.detection_events.create_index("event_type", name="events_event_type")
+        db.detection_events.create_index([("incident_status", 1), ("created_at", -1)],
+                                         name="events_incident_status_date")
+        db.detection_events.create_index("alert_delivery.status", name="events_alert_delivery_status")
         db.detection_events.create_index([("video_id", 1), ("timestamp_seconds", 1), ("event_type", 1)],
                                          name="events_video_timeline")
         db.processing_jobs.create_index("video_id", name="jobs_video_id")
@@ -99,9 +120,12 @@ def init_database(app):
         db.pose_detection_frames.create_index([("video_id", 1), ("timestamp_seconds", 1)],
                                               name="pose_frames_video_time")
         app.extensions["mongo_available"] = True
+        app.extensions["mongo_retry_at"] = 0.0
     except PyMongoError as exc:
         # The exception text can include the configured host; never log a URI.
         app.extensions["mongo_error"] = _friendly_connection_error(exc)
+        app.extensions["mongo_retry_at"] = time.monotonic() + max(
+            0.0, float(app.config.get("MONGO_RETRY_INTERVAL_SECONDS", 5)))
         log.warning("MongoDB startup %s failed (%s, code=%s): %s",
                     stage, type(exc).__name__, getattr(exc, "code", None), app.extensions["mongo_error"])
         log.error("MongoDB startup %s traceback (credentials redacted):\n%s",
@@ -109,21 +133,35 @@ def init_database(app):
 
 
 def get_database():
-    client = current_app.extensions["mongo_client"]
+    app = current_app._get_current_object()
+    client = app.extensions.get("mongo_client")
     if client is None:
-        raise DatabaseUnavailable(current_app.extensions.get("mongo_error") or (
-            "MongoDB is not configured. Open the .env file beside app.py and replace the value after "
-            "MONGO_URI= with the connection string copied from MongoDB Atlas (Connect → Drivers → Python → PyMongo). "
-            "Keep that connection string private."
-        ))
-    if not current_app.extensions.get("mongo_available"):
+        # A startup SRV/DNS failure leaves no MongoClient to ping. Retry client
+        # construction after a short backoff so a later successful standalone
+        # ping/network recovery is also observed by this already-running Flask app.
+        if time.monotonic() >= app.extensions.get("mongo_retry_at", 0.0):
+            init_database(app)
+            client = app.extensions.get("mongo_client")
+        if client is None:
+            raise DatabaseUnavailable(app.extensions.get("mongo_error") or (
+                "MongoDB is not configured. Open the .env file beside app.py and replace the value after "
+                "MONGO_URI= with the connection string copied from MongoDB Atlas (Connect → Drivers → Python → PyMongo). "
+                "Keep that connection string private."
+            ))
+    if not app.extensions.get("mongo_available"):
+        if time.monotonic() < app.extensions.get("mongo_retry_at", 0.0):
+            raise DatabaseUnavailable(app.extensions.get("mongo_error") or "MongoDB is temporarily unavailable.")
         try:
             client.admin.command("ping")
-            current_app.extensions["mongo_available"] = True
-            current_app.extensions["mongo_error"] = None
+            app.extensions["mongo_available"] = True
+            app.extensions["mongo_error"] = None
+            app.extensions["mongo_retry_at"] = 0.0
         except PyMongoError as exc:
-            current_app.extensions["mongo_error"] = _friendly_connection_error(exc)
+            app.extensions["mongo_available"] = False
+            app.extensions["mongo_error"] = _friendly_connection_error(exc)
+            app.extensions["mongo_retry_at"] = time.monotonic() + max(
+                0.0, float(app.config.get("MONGO_RETRY_INTERVAL_SECONDS", 5)))
             log.error("MongoDB request ping failed (%s); traceback follows:\n%s",
-                      type(exc).__name__, sanitized_traceback(exc, current_app.config))
-            raise DatabaseUnavailable(current_app.extensions["mongo_error"]) from exc
-    return current_app.extensions["mongo_db"]
+                      type(exc).__name__, sanitized_traceback(exc, app.config))
+            raise DatabaseUnavailable(app.extensions["mongo_error"]) from exc
+    return app.extensions["mongo_db"]

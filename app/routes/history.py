@@ -3,8 +3,9 @@ from datetime import datetime, timezone
 from bson import ObjectId
 from flask import Blueprint, current_app, render_template, request, redirect, url_for, flash, abort
 from app.services.repository import (list_videos, delete_video, object_id, video_is_processing,
-    get_video, queue_video_retry, create_job, update_video)
+    get_video, queue_video_retry, create_job, update_video, update_job, get_job_for_video)
 from app.services.storage import safe_video_path, safe_processed_path
+from app.services.timestamps import event_video_seconds, format_video_timestamp
 
 bp = Blueprint("history", __name__)
 
@@ -30,7 +31,7 @@ def history():
     q = request.args.get("q", "").strip()[:100]
     status = request.args.get("status", "")
     try:
-        page = max(1, min(100000, int(request.args.get("page", "1"))))
+        page = max(1, min(1000, int(request.args.get("page", "1"))))
     except ValueError:
         page = 1
     videos, total = list_videos(q, status, page)
@@ -43,6 +44,13 @@ def history():
         video["face_analysis"] = video.get("face_analysis") or {"status": "not_run", "face_observations": 0}
         video["pose_analysis"] = video.get("pose_analysis") or {"status": "not_configured"}
         video["object_analysis"] = video.get("object_analysis") or {"status": "not_configured"}
+        video["fight_analysis"] = video.get("fight_analysis") or {"status": "not_configured", "candidate_event_count": 0}
+        video["suspected_fighting_count"] = video.get("suspected_fighting_count", 0)
+        entry = video.get("latest_restricted_zone_entry")
+        seconds = event_video_seconds(entry)
+        video["latest_zone_entry_time"] = format_video_timestamp(seconds) if seconds is not None else None
+        video["latest_zone_entry_name"] = ((entry or {}).get("zone_name") or
+            ((entry or {}).get("details") or {}).get("zone_name"))
     return render_template("history.html", videos=videos, q=q, status=status, page=page, total=total, per_page=25)
 
 
@@ -73,12 +81,17 @@ def retry(video_id):
         app.extensions["processing_slots"].release()
         flash("This video was already claimed for retry or is no longer retryable.", "error")
         return redirect(url_for("videos.results", video_id=video_id))
-    now = datetime.now(timezone.utc)
     try:
-        job_id = create_job({"video_id": ObjectId(video_id), "status": "queued", "progress_percent": 0,
-                             "started_at": None, "created_at": now, "completed_at": None,
-                             "error_message": None, "retry": True})
-        update_video(video_id, {"active_job_id": job_id})
+        if video.get("local_only"):
+            job_id = (get_job_for_video(video_id) or {}).get("_id")
+            if not job_id:
+                raise RuntimeError("Local retry job was not created.")
+        else:
+            now = datetime.now(timezone.utc)
+            job_id = create_job({"video_id": ObjectId(video_id), "status": "queued", "progress_percent": 0,
+                                 "started_at": None, "created_at": now, "completed_at": None,
+                                 "error_message": None, "retry": True})
+            update_video(video_id, {"active_job_id": job_id})
     except Exception:
         try:
             update_video(video_id, {"processing_status": "failed",

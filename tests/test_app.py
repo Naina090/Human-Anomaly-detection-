@@ -1,22 +1,24 @@
 import io
+import json
 import os
 import sys
 import time
 import types
 from datetime import datetime, timezone
+from pathlib import Path
 
 import cv2
 import mongomock
 import numpy as np
 import pytest
 from bson import ObjectId
-from pymongo.errors import OperationFailure
+from pymongo.errors import ConfigurationError, OperationFailure
 
 from app import create_app
-from app.db import DatabaseUnavailable, _friendly_connection_error
+from app.db import DatabaseUnavailable, _friendly_connection_error, get_database
 from app.services.repository import (
     create_video, dashboard_stats, delete_video, get_video, list_videos,
-    object_id, report_data, update_video,
+    object_id, report_data, update_video, create_job, claim_job, update_incident,
 )
 from app.services.fall_detector import YoloPoseFallDetector
 from app.services.storage import safe_video_path, safe_processed_path
@@ -24,8 +26,11 @@ from app.services.face_detector import OpenCVFaceDetector, FaceDetectorUnavailab
 from app.services.object_detector import (ObjectDetectorUnavailable, YoloObjectTracker,
     detector_status as object_detector_status)
 from app.services.video_processor import analyze_video
+from app.services.video_processor import make_browser_playable_webm
+from app.services.roi import ZoneValidationError, associate_event_with_zones, parse_zones
 from app.services.video_validator import validate_video_file, VideoValidationError
-from app.services.report_service import build_analysis_summary, video_report_csv
+from app.services.report_service import build_analysis_summary, video_report_csv, explain_event
+from app.services.pdf_report import build_pdf
 
 
 @pytest.fixture()
@@ -35,8 +40,10 @@ def app(tmp_path):
         "TESTING": True, "SECRET_KEY": "test-secret", "MONGO_CLIENT": client,
         "MONGO_DB_NAME": "test_human_anomaly", "MONGO_PING_ON_STARTUP": False,
         "UPLOAD_DIR": str(tmp_path / "uploads"), "PROCESSED_DIR": str(tmp_path / "processed"),
+        "LOCAL_FALLBACK_PATH": str(tmp_path / "local_history.json"),
         "MAX_CONTENT_LENGTH": 2_000_000, "MAX_DURATION_SECONDS": 30,
-        "SAMPLE_EVERY_SECONDS": 0.1,
+        "SAMPLE_EVERY_SECONDS": 0.1, "POSE_MODEL_PATH": "", "OBJECT_MODEL_PATH": "",
+        "FIGHT_DETECTION_ENABLED": False, "FIGHT_MODEL_PATH": "",
     })
     yield application
     application.extensions["processing_executor"].shutdown(wait=True, cancel_futures=True)
@@ -78,14 +85,41 @@ def wait_for_status(app, video_id, statuses=("complete", "failed")):
     while time.monotonic() < deadline:
         row = app.extensions["mongo_db"].videos.find_one({"_id": ObjectId(video_id)})
         if row and row["processing_status"] in statuses:
-            return row
+            job = app.extensions["mongo_db"].processing_jobs.find_one(
+                {"video_id": ObjectId(video_id)}, sort=[("created_at", -1)])
+            job_status = (job or {}).get("status")
+            if ((row["processing_status"] == "complete" and job_status == "completed") or
+                    (row["processing_status"] == "failed" and job_status == "failed") or
+                    row["processing_status"] not in {"complete", "failed"}):
+                return row
         time.sleep(.02)
     raise AssertionError("Background video job did not finish in time")
 
 
+def wait_for_local_status(app, video_id, statuses=("complete", "failed"), timeout=10):
+    from app.services.local_fallback import get_pending_video
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with app.app_context():
+            row = get_pending_video(video_id)
+        job_status = (row or {}).get("local_job", {}).get("status")
+        video_status = (row or {}).get("processing_status")
+        job_is_terminal_for_video = (
+            (video_status == "complete" and job_status == "completed") or
+            (video_status == "failed" and job_status == "failed") or
+            video_status not in {"complete", "failed"})
+        if row and video_status in statuses and job_is_terminal_for_video:
+            return row
+        time.sleep(.02)
+    raise AssertionError("Local background job did not finish in time")
+
+
 def test_app_startup_and_pages_render(client):
-    for url in ("/", "/dashboard", "/about", "/history", "/reports", "/upload"):
+    for url in ("/", "/dashboard", "/about", "/history", "/incidents", "/reports", "/upload"):
         assert client.get(url).status_code == 200
+    upload = client.get("/upload")
+    assert b"Smart Surveillance Zone Configuration" in upload.data
+    assert b"roi-canvas" in upload.data and client.get("/static/js/roi.js").status_code == 200
 
 
 def test_empty_history_shows_real_empty_state(client):
@@ -148,13 +182,49 @@ def test_mongodb_connection_failure_is_friendly(tmp_path):
     client = app.test_client()
     for path in ("/dashboard", "/history", "/reports"):
         response = client.get(path)
-        assert response.status_code == 503
-        assert b"MongoDB is unavailable" in response.data
-        assert b"MONGODB CONNECTION" in response.data
-        assert b"temporarily unavailable" in response.data
+        assert response.status_code == 200
+        assert response.data
         assert b"internal error" not in response.data.lower()
     assert client.get("/").status_code == 200
     app.extensions["mongo_client"].close()
+
+
+def test_flask_retries_client_creation_after_temporary_startup_dns_failure(tmp_path, monkeypatch):
+    import app.db as database_module
+    attempts = {"count": 0}
+    recovered_client = mongomock.MongoClient()
+
+    def client_factory(*_args, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise ConfigurationError("DNS SRV lookup temporarily timed out")
+        return recovered_client
+
+    monkeypatch.setattr(database_module, "MongoClient", client_factory)
+    application = create_app({"TESTING": True, "SECRET_KEY": "test", "MONGO_URI": "mongodb+srv://user:pass@cluster.example.test/db",
+        "MONGO_DB_NAME": "recovery_test", "MONGO_TIMEOUT_MS": 20, "MONGO_RETRY_INTERVAL_SECONDS": 0,
+        "UPLOAD_DIR": str(tmp_path / "u"), "PROCESSED_DIR": str(tmp_path / "p")})
+    assert application.extensions["mongo_client"] is None
+    assert application.extensions["mongo_available"] is False
+
+    with application.app_context():
+        db = get_database()
+        saved_id = db.videos.insert_one({"original_filename": "recovered.avi"}).inserted_id
+        assert db.videos.find_one({"_id": saved_id})["original_filename"] == "recovered.avi"
+
+    assert attempts["count"] == 2
+    assert application.extensions["mongo_available"] is True
+    assert application.extensions["mongo_ping_ok"] is True
+    application.extensions["processing_executor"].shutdown(wait=True, cancel_futures=True)
+    recovered_client.close()
+
+
+def test_replica_set_no_primary_is_not_misreported_as_dns():
+    from pymongo.errors import ServerSelectionTimeoutError
+    error = ServerSelectionTimeoutError("No replica set members match selector; ReplicaSetNoPrimary")
+    message = _friendly_connection_error(error)
+    assert "replica-set primary" in message
+    assert "DNS" not in message
 
 
 def test_analyze_video_route_logs_unexpected_upload_failure_without_exposing_traceback(
@@ -256,9 +326,8 @@ def test_missing_or_example_mongodb_uri_keeps_public_pages_available(tmp_path):
         assert app.extensions["mongo_client"] is None
         assert client.get("/").status_code == 200
         response = client.get("/dashboard")
-        assert response.status_code == 503
-        assert b"replace the value after MONGO_URI=" in response.data
-        assert b"MongoDB Atlas" in response.data
+        assert response.status_code == 200
+        assert b"Unavailable" in response.data
         app.extensions["processing_executor"].shutdown(wait=True, cancel_futures=True)
 
 
@@ -284,6 +353,17 @@ def test_operation_failure_messages_distinguish_auth_and_permissions():
     permission_message = _friendly_connection_error(OperationFailure("not authorized", 13))
     assert "authentication failed" in auth_message.lower()
     assert "permission" in permission_message.lower()
+
+
+def test_dns_failure_message_names_timed_out_resolver_without_leaking_uri():
+    uri = "mongodb+srv://safe-user:secret-pass@cluster.example.mongodb.net/db"
+    message = _friendly_connection_error(
+        ConfigurationError("DNS SRV resolution timed out for " + uri +
+                            "; Server Do53:192.168.1.1@53 answered timeout")
+    )
+    assert "192.168.1.1" in message
+    assert "UDP/TCP port 53" in message
+    assert "secret-pass" not in message and uri not in message
 
 
 def test_fall_heuristic_requires_a_transition_and_persistence():
@@ -391,6 +471,181 @@ def test_pose_model_alias_does_not_trigger_automatic_download(monkeypatch):
         YoloPoseFallDetector("yolo26n-pose.pt")
 
 
+def test_pose_detector_uses_persistent_local_tracker_and_preserves_real_person_outputs(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    import app.services.fall_detector as pose_module
+    marker = tmp_path / "local-pose.pt"
+    marker.write_bytes(b"test fixture only")
+    monkeypatch.setattr(pose_module.importlib.util, "find_spec", lambda _name: object())
+    calls = []
+    points = np.zeros((1, 17, 2), dtype=np.float32)
+    points[0, 5] = [20, 10]; points[0, 6] = [30, 10]
+    points[0, 11] = [22, 30]; points[0, 12] = [28, 30]
+    confidences = np.full((1, 17), .9, dtype=np.float32)
+    class FixtureResult:
+        keypoints = SimpleNamespace(xy=points, conf=confidences)
+        boxes = SimpleNamespace(xyxy=np.array([[10, 5, 40, 60]], dtype=np.float32),
+                                conf=np.array([.87], dtype=np.float32), id=np.array([41], dtype=np.float32))
+        def plot(self): return np.zeros((64, 64, 3), dtype=np.uint8)
+    class FixtureYOLO:
+        task = "pose"
+        def __init__(self, _path): pass
+        def track(self, _frame, **kwargs):
+            calls.append(kwargs)
+            return [FixtureResult()]
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=FixtureYOLO))
+    detector = YoloPoseFallDetector(str(marker), {"tracker": "bytetrack.yaml"})
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    _overlay, _event, evidence = detector.inspect_with_evidence(frame, 0.0)
+    _overlay, _event, evidence = detector.inspect_with_evidence(frame, 1.0)
+    assert len(calls) == 2 and all(call["persist"] is True for call in calls)
+    person = evidence["people"][0]
+    assert person["track_id"] == 41
+    assert person["bbox_xyxy"] == [10.0, 5.0, 40.0, 60.0]
+    assert person["detection_confidence"] == .87
+    assert evidence["tracking_status"] == "tracked"
+    assert evidence["people"][0]["keypoints"]["left_shoulder"]["confidence"] == .9
+
+
+def test_pose_detector_rejects_local_non_pose_weights(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    import app.services.fall_detector as pose_module
+    marker = tmp_path / "detect-only.pt"
+    marker.write_bytes(b"test fixture only")
+    monkeypatch.setattr(pose_module.importlib.util, "find_spec", lambda _name: object())
+    class DetectOnlyModel:
+        task = "detect"
+        def __init__(self, _path): pass
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=DetectOnlyModel))
+    with pytest.raises(pose_module.DetectorUnavailable, match="not a pose model"):
+        pose_module.YoloPoseFallDetector(str(marker))
+
+
+def test_zone_tracker_requires_confirmed_transition_and_allows_exit_reentry():
+    from app.services.video_processor import _zone_transition_events
+    zones = [{"zone_id": "restricted", "name": "Restricted", "enabled": True,
+              "points": [[.3, .3], [.7, .3], [.7, .7], [.3, .7]]}]
+    def sample(t, x1, x2, track=7, confidence=.8):
+        return {"timestamp_seconds": t, "frame_number": int(t * 10), "people": [
+            {"track_id": track, "bbox_xyxy": [x1, 10, x2, 50], "detection_confidence": confidence}]}
+    records = [sample(0, 10, 20), sample(.5, 10, 20),
+               sample(1, 35, 45, confidence=.91), sample(1.5, 35, 45),
+               sample(2, 10, 20), sample(2.5, 10, 20),
+               sample(3, 35, 45), sample(3.5, 35, 45)]
+    events = _zone_transition_events(records, zones, 100, 100)
+    entries = [event for event in events if event["event_type"] == "RESTRICTED_ZONE_ENTRY"]
+    assert len(entries) == 2
+    assert [event["timestamp_seconds"] for event in entries] == [1, 3]
+    assert entries[0]["confidence"] == .91
+    assert entries[0]["details"]["zone_name"] == "Restricted"
+    assert "confirmed outside and then inside" in explain_event(entries[0])
+    assert len([event for event in events if event["event_type"] == "zone_exit"]) == 1
+    assert _zone_transition_events(records, [], 100, 100) == []
+
+
+def test_zone_tracker_does_not_infer_entry_from_first_observation_or_dwell():
+    from app.services.video_processor import _zone_transition_events
+    zones = [{"zone_id": "z", "name": "Zone", "enabled": True,
+              "points": [[.3, .3], [.7, .3], [.7, .7], [.3, .7]]}]
+    records = [{"timestamp_seconds": t, "frame_number": t,
+                "people": [{"track_id": 1, "bbox_xyxy": [35, 10, 45, 50], "detection_confidence": .7}]}
+               for t in range(6)]
+    events = _zone_transition_events(records, zones, 100, 100)
+    assert [event["event_type"] for event in events] == ["zone_presence_observed"]
+    assert "entry time is unknown" in explain_event(events[0])
+
+
+def test_zone_tracker_supports_multiple_people_zones_and_disabled_zones():
+    from app.services.video_processor import _zone_transition_events
+    zones = [
+        {"zone_id": "left", "name": "Left", "enabled": True,
+         "points": [[.1, .3], [.35, .3], [.35, .7], [.1, .7]]},
+        {"zone_id": "right", "name": "Right", "enabled": True,
+         "points": [[.65, .3], [.9, .3], [.9, .7], [.65, .7]]},
+        {"zone_id": "off", "name": "Disabled", "enabled": False,
+         "points": [[.4, .3], [.6, .3], [.6, .7], [.4, .7]]},
+    ]
+    def sample(t, people):
+        return {"timestamp_seconds": t, "frame_number": int(t * 10), "people": people}
+    def person(track, x1, x2):
+        return {"track_id": track, "bbox_xyxy": [x1, 10, x2, 50], "detection_confidence": .8}
+    records = [sample(0, [person(1, 40, 50), person(2, 40, 50)]),
+               sample(.5, [person(1, 40, 50), person(2, 40, 50)]),
+               sample(1, [person(1, 20, 30), person(2, 70, 80)]),
+               sample(1.5, [person(1, 20, 30), person(2, 70, 80)])]
+    entries = [event for event in _zone_transition_events(records, zones, 100, 100)
+               if event["event_type"] == "RESTRICTED_ZONE_ENTRY"]
+    assert {(event["track_id"], event["details"]["zone_id"]) for event in entries} == {(1, "left"), (2, "right")}
+
+
+def test_zone_tracker_ignores_missing_ids_interruptions_and_boundary_jitter():
+    from app.services.video_processor import _zone_transition_events
+    zones = [{"zone_id": "z", "name": "Zone", "enabled": True,
+              "points": [[.3, .3], [.7, .3], [.7, .7], [.3, .7]]}]
+    def record(t, x1, x2, track=1):
+        people = [] if track is False else [{"track_id": None if track is None else track,
+            "bbox_xyxy": [x1, 10, x2, 50], "detection_confidence": .8}]
+        return {"timestamp_seconds": t, "frame_number": t, "people": people}
+    missing = [record(0, 10, 20, None), record(.5, 35, 45, None), record(1, 35, 45, None)]
+    assert not [e for e in _zone_transition_events(missing, zones, 100, 100) if e["event_type"] == "RESTRICTED_ZONE_ENTRY"]
+    interrupted = [record(0, 10, 20), record(.5, 10, 20), record(3, 35, 45), record(3.5, 35, 45)]
+    assert not [e for e in _zone_transition_events(interrupted, zones, 100, 100) if e["event_type"] == "RESTRICTED_ZONE_ENTRY"]
+    jitter = [record(0, 10, 20), record(.5, 10, 20), record(1, 29, 35),
+              record(1.5, 35, 45), record(2, 29, 35), record(2.5, 35, 45)]
+    assert not [e for e in _zone_transition_events(jitter, zones, 100, 100) if e["event_type"] == "RESTRICTED_ZONE_ENTRY"]
+
+
+def test_sampled_pose_pipeline_saves_one_neutral_zone_entry_for_occupied_track(tmp_path):
+    from app.services.video_processor import analyze_video
+    source = tmp_path / "tracked-zone.avi"
+    make_video(source)
+    zones = [{"zone_id": "door", "name": "Door", "enabled": True,
+              "points": [[.1, .1], [.9, .1], [.9, .9], [.1, .9]]}]
+    class TrackedPoseFixture:
+        METHOD = "fixture pose tracker"
+        def inspect_with_evidence(self, frame, timestamp):
+            evidence = {"timestamp_seconds": timestamp, "person_count": 1,
+                            "people": [{"track_id": 3, "bbox_xyxy": [20, 5, 40, 30],
+                                    "detection_confidence": .91, "keypoints": {}}],
+                        "transition_status": "observed_no_candidate"}
+            return frame, None, evidence
+    result = analyze_video(str(source), .2, 30, TrackedPoseFixture(), zones=zones)
+    assert [event["event_type"] for event in result["events"]] == ["zone_presence_observed"]
+    assert result["events"][0]["timestamp_seconds"] == 0
+    assert result["events"][0]["anomaly_score"] is None
+    assert result["pose_analysis"]["person_track_count_estimate"] == 1
+    assert result["pose_analysis"]["zone_presence_observed_count"] == 1
+    assert result["pose_analysis"]["zone_entry_count"] == 0
+    assert result["pose_analysis"]["zone_exit_count"] == 0
+
+
+def test_enabled_zone_uses_configured_tracking_cadence_only_when_active(tmp_path):
+    from app.services.video_processor import analyze_video
+    source = tmp_path / "zone-cadence.avi"
+    make_video(source)
+    class CountingDetector:
+        METHOD = "fixture"
+        def __init__(self): self.calls = 0
+        def inspect_with_evidence(self, frame, timestamp):
+            self.calls += 1
+            return frame, None, {"timestamp_seconds": timestamp, "person_count": 0, "people": []}
+    zones = [{"zone_id": "test", "name": "Test", "enabled": True,
+              "points": [[.2, .2], [.8, .2], [.8, .8], [.2, .8]]}]
+    detector = CountingDetector()
+    zone_result = analyze_video(str(source), 1.0, 30, detector, zones=zones,
+                                zone_sample_seconds=.5)
+    assert detector.calls == 2
+    assert zone_result["sample_interval_seconds"] == .5
+    detector = CountingDetector()
+    normal_result = analyze_video(str(source), 1.0, 30, detector,
+                                  zones=[{**zones[0], "enabled": False}],
+                                  zone_sample_seconds=.5)
+    assert detector.calls == 1
+    assert normal_result["sample_interval_seconds"] == 1.0
+
+
 def test_object_sampling_summary_and_csv_use_actual_structured_results(tmp_path):
     source = tmp_path / "sampled.avi"
     make_video(source)
@@ -463,9 +718,42 @@ def test_processed_path_is_restricted_to_generated_name(tmp_path):
     name = "507f1f77bcf86cd799439011_annotated.mp4"
     (root / name).write_bytes(b"video")
     assert safe_processed_path({"processed_filename": name}, str(root)) == str((root / name).resolve())
+    webm_name = "507f1f77bcf86cd799439011_annotated.webm"
+    (root / webm_name).write_bytes(b"webm")
+    assert safe_processed_path({"processed_filename": webm_name}, str(root)) == str((root / webm_name).resolve())
     outside = tmp_path / "private.txt"
     outside.write_text("keep")
     assert safe_processed_path({"processed_filename": str(outside)}, str(root)) is None
+
+
+def test_legacy_mp4v_result_is_converted_to_browser_playable_webm(client, app, tmp_path):
+    video_id = ObjectId()
+    filename = f"{video_id}_annotated.mp4"
+    source = tmp_path / "processed" / filename
+    source.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"mp4v"), 10, (64, 48))
+    if not writer.isOpened():
+        pytest.skip("OpenCV MP4V test writer is unavailable")
+    for index in range(5):
+        writer.write(np.full((48, 64, 3), index * 25, dtype=np.uint8))
+    writer.release()
+    app.config["PROCESSED_DIR"] = str(source.parent)
+    app.extensions["mongo_db"].videos.insert_one({
+        "_id": video_id, "original_filename": "legacy.avi", "stored_filename": "not-used.avi",
+        "file_path": "not-used.avi", "processing_status": "complete", "processed_filename": filename,
+    })
+
+    response = client.get(f"/processed/{video_id}")
+
+    assert response.status_code == 200
+    assert response.mimetype == "video/webm"
+    converted = tmp_path / "round-trip.webm"
+    converted.write_bytes(response.data)
+    capture = cv2.VideoCapture(str(converted))
+    ok, frame = capture.read()
+    capture.release()
+    assert ok and frame is not None and frame.size > 0
+    assert source.exists()  # Conversion preserves the original stored result.
 
 
 def test_missing_configured_pose_model_is_reported_as_partial_success(client, app, tmp_path):
@@ -558,6 +846,9 @@ def test_upload_saves_processing_result_and_database_error_cleanup(client, app, 
     assert response.status_code == 302
     video_id = response.headers["Location"].rsplit("/", 1)[-1]
     saved = wait_for_status(app, video_id)
+    job = app.extensions["mongo_db"].processing_jobs.find_one({"video_id": ObjectId(video_id)})
+    assert job["status"] == "completed" and job["progress_percent"] == 100
+    assert saved["active_job_id"] == job["_id"]
     result_page = client.get(response.headers["Location"])
     assert result_page.status_code == 200 and b"Video validation complete" in result_page.data
     assert b"OpenCV validation passed" in result_page.data
@@ -573,10 +864,20 @@ def test_upload_saves_processing_result_and_database_error_cleanup(client, app, 
     assert download.status_code == 200 and download.data == payload
     assert "attachment" in download.headers["Content-Disposition"]
     assert saved.get("processed_filename")
+    assert saved["processed_filename"].endswith("_annotated.webm")
     annotated = client.get(f"/processed/{video_id}")
     annotated_download = client.get(f"/processed/{video_id}/download")
     assert annotated.status_code == 200 and annotated.data
     assert annotated.data != original.data
+    assert annotated.mimetype == "video/webm"
+    # Verify that the exact streamed result is a decodable video, not an empty
+    # container that would render as the browser's black video player.
+    annotated_path = tmp_path / "served-annotated.webm"
+    annotated_path.write_bytes(annotated.data)
+    decoded = cv2.VideoCapture(str(annotated_path))
+    ok, frame = decoded.read()
+    decoded.release()
+    assert ok and frame is not None and frame.size > 0
     assert annotated_download.status_code == 200
     assert "attachment" in annotated_download.headers["Content-Disposition"]
     assert app.extensions["mongo_db"].face_detection_frames.count_documents({"video_id": ObjectId(video_id)}) > 0
@@ -597,11 +898,12 @@ def test_upload_saves_processing_result_and_database_error_cleanup(client, app, 
     before = set(os.listdir(app.config["UPLOAD_DIR"]))
     failed = client.post("/upload", data={"csrf_token": csrf(client),
         "video": (io.BytesIO(payload), "orphan.avi")}, content_type="multipart/form-data")
-    assert failed.status_code == 503
-    assert b"OpenCV validated the video" in failed.data
-    assert b"no video record or analysis job was saved" in failed.data
+    assert failed.status_code == 302
+    assert len(list((tmp_path / "uploads").iterdir())) == len(before) + 1
+    assert b"orphan.avi" in client.get("/history").data
     app.extensions["processing_executor"].shutdown(wait=True, cancel_futures=True)
-    assert set(os.listdir(app.config["UPLOAD_DIR"])) == before
+    assert before.issubset(set(os.listdir(app.config["UPLOAD_DIR"])))
+    assert len(set(os.listdir(app.config["UPLOAD_DIR"])) - before) == 1
 
 
 def test_invalid_video_is_rejected_before_database_or_job_creation(client, app, tmp_path):
@@ -632,6 +934,201 @@ def test_video_validator_checks_decodable_frame_and_extracts_metadata(tmp_path):
 
     with pytest.raises(VideoValidationError):
         validate_video_file(str(tmp_path / "missing.mp4"))
+
+
+@pytest.mark.parametrize("zones", [[], [{"zone_id": "front_gate", "name": "Front gate", "enabled": True,
+    "points": [[.1, .1], [.9, .1], [.9, .9], [.1, .9]]}]])
+def test_valid_upload_completes_in_local_fallback_when_mongodb_write_fails(
+        client, app, tmp_path, monkeypatch, zones):
+    from app.db import DatabaseUnavailable
+    import app.routes.videos as video_routes
+    from app.services.local_fallback import get_pending_video
+    monkeypatch.setattr(video_routes, "create_video",
+                        lambda _document: (_ for _ in ()).throw(DatabaseUnavailable("temporary network failure")))
+    app.extensions["mongo_available"] = False
+    payload = make_video(tmp_path / "offline-upload.avi")
+    response = client.post("/upload", data={"csrf_token": csrf(client),
+        "roi_zones": json.dumps(zones), "video": (io.BytesIO(payload), "offline-upload.avi")},
+        content_type="multipart/form-data")
+    assert response.status_code == 302
+    video_id = response.location.rsplit("/", 1)[-1]
+    assert app.extensions["mongo_db"].videos.count_documents({}) == 0
+    local_files = list((tmp_path / "uploads").iterdir())
+    assert len(local_files) == 1 and local_files[0].read_bytes() == payload
+    row = wait_for_local_status(app, video_id)
+    assert row["processing_status"] == "complete"
+    assert row["local_job"]["status"] == "completed"
+    assert row["local_job"]["progress_percent"] == 100
+    assert row["pose_analysis"]["status"] == "not_configured"
+    assert row["face_analysis"]["status"] == "complete"
+    assert row["zones"] == zones
+    history = client.get("/history")
+    assert history.status_code == 200 and b"offline-upload.avi" in history.data
+    assert b"complete" in history.data
+    assert b"offline-upload.avi" in client.get("/dashboard").data
+    assert client.get("/reports").status_code == 200
+    result = client.get(response.location)
+    assert result.status_code == 200 and b"Primary database unavailable" in result.data
+    assert b"local fallback" in result.data.lower()
+    playback = client.get(f"/media/{video_id}")
+    assert playback.status_code == 200 and playback.data == payload
+    assert app.extensions["mongo_db"].processing_jobs.count_documents({}) == 0
+    with app.app_context():
+        assert get_pending_video(video_id)["local_only"] is True
+
+
+def test_local_background_failure_is_persisted_and_reported(client, app, tmp_path, monkeypatch):
+    from app.db import DatabaseUnavailable
+    from app.services.video_processor import VideoError
+    import app.routes.videos as video_routes
+    monkeypatch.setattr(video_routes, "create_video",
+        lambda _doc: (_ for _ in ()).throw(DatabaseUnavailable("offline")))
+    monkeypatch.setattr(video_routes, "analyze_video",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(VideoError("fixture decode failure")))
+    payload = make_video(tmp_path / "local-failure.avi")
+    response = client.post("/upload", data={"csrf_token": csrf(client),
+        "video": (io.BytesIO(payload), "local-failure.avi")}, content_type="multipart/form-data")
+    video_id = response.location.rsplit("/", 1)[-1]
+    row = wait_for_local_status(app, video_id)
+    assert row["processing_status"] == "failed"
+    assert row["local_job"]["status"] == "failed"
+    assert "fixture decode failure" in row["error_message"]
+    assert client.get(f"/api/videos/{video_id}/status").json["status"] == "failed"
+    results = client.get(response.location)
+    assert results.status_code == 200 and b"fixture decode failure" in results.data
+
+
+def test_mocked_fighting_candidate_persists_to_results_history_dashboard_and_reports(
+        client, app, tmp_path, monkeypatch):
+    import app.routes.videos as video_routes
+
+    class FixtureFightDetector:
+        METHOD = "fixture temporal classifier"
+
+        def __init__(self, *_args, **_kwargs):
+            self.status = "ready"
+            self.error_message = None
+
+        def observe_frame(self, *_args):
+            pass
+
+        def finish(self):
+            event = {"event_type": "SUSPECTED_FIGHTING", "label": "Mock candidate for test only",
+                     "timestamp_seconds": .2, "start_timestamp_seconds": .2,
+                     "end_timestamp_seconds": .8, "frame_number": 2,
+                     "model_score": .73, "anomaly_score": None, "confidence": None,
+                     "track_id": None, "detection_method": self.METHOD,
+                     "details": {"model_score": .73, "score_kind": "test fixture",
+                                 "zone_association_status": "unavailable"}}
+            summary = {"status": "complete", "method": self.METHOD,
+                       "model_name": "fixture-only", "model_revision": "test",
+                       "frames_sampled": 16, "windows_analyzed": 2,
+                       "candidate_event_count": 1, "maximum_model_score": .73,
+                       "decision_threshold": .4, "window_seconds": 4,
+                       "window_stride_seconds": 1, "confirmation_windows": 2,
+                       "error_message": None,
+                       "limitation": "Fixture output, not a real prediction."}
+            return [event], summary
+
+    monkeypatch.setattr(video_routes, "FightActionDetector", FixtureFightDetector)
+    app.config.update({"FIGHT_DETECTION_ENABLED": True,
+                       "FIGHT_MODEL_PATH": str(tmp_path / "fixture-weights.pt")})
+    payload = make_video(tmp_path / "fight-workflow.avi")
+    response = client.post("/upload", data={"csrf_token": csrf(client),
+        "video": (io.BytesIO(payload), "fight-workflow.avi")},
+        content_type="multipart/form-data")
+    assert response.status_code == 302
+    video_id = response.location.rsplit("/", 1)[-1]
+    row = wait_for_status(app, video_id)
+    assert row["processing_status"] == "complete"
+    assert row["fight_analysis"]["status"] == "complete"
+    saved = app.extensions["mongo_db"].detection_events.find_one(
+        {"video_id": ObjectId(video_id), "event_type": "SUSPECTED_FIGHTING"})
+    assert saved and saved["model_score"] == .73
+    result_page = client.get(response.location)
+    assert b"Fighting detection" in result_page.data
+    assert b"Mock candidate for test only" in result_page.data
+    assert b"00:00.20" in result_page.data and b"00:00.80" in result_page.data
+    video_csv = client.get(f"/results/{video_id}/report.csv")
+    assert b"SUSPECTED_FIGHTING" in video_csv.data
+    assert b"00:00.20-00:00.80" in video_csv.data
+    assert b"00:00.20" in client.get("/reports").data
+    assert b"00:00.20-00:00.80" in client.get("/reports.csv").data
+    assert b"SUSPECTED_FIGHTING" in client.get(f"/results/{video_id}/report.pdf").data
+    assert b"1" in client.get("/dashboard").data
+    assert b"Mock candidate for test only" in client.get("/incidents").data
+
+
+def test_suspected_fighting_event_is_reviewable_in_local_fallback(app):
+    from app.services.local_fallback import save_pending_upload, list_pending_incidents
+    from app.services.repository import save_events
+
+    with app.app_context():
+        video_id, job_id = save_pending_upload({
+            "original_filename": "offline-review.mp4", "stored_filename": "offline.mp4",
+            "file_path": "offline.mp4", "processing_status": "complete",
+            "fight_analysis": {"status": "complete", "candidate_event_count": 1},
+            "local_only": True,
+        }, "Atlas unavailable")
+        assert save_events(video_id, job_id, [{
+            "event_type": "SUSPECTED_FIGHTING", "timestamp_seconds": 1.0,
+            "start_timestamp_seconds": 1.0, "end_timestamp_seconds": 2.0,
+            "model_score": .68, "detection_method": "fixture temporal model",
+            "details": {"zone_association_status": "unavailable"},
+        }]) == 1
+        rows = list_pending_incidents()
+        assert len(rows) == 1 and rows[0]["event_type"] == "SUSPECTED_FIGHTING"
+        assert rows[0]["model_score"] == .68
+        stats = dashboard_stats()
+        assert stats["suspected_fighting_events"] == 1
+
+
+def test_missing_fighting_weights_do_not_break_video_upload(client, app, tmp_path):
+    app.config.update({"FIGHT_DETECTION_ENABLED": True,
+                       "FIGHT_MODEL_PATH": str(tmp_path / "weights-not-installed.pt")})
+    payload = make_video(tmp_path / "without-fight-weights.avi")
+    response = client.post("/upload", data={"csrf_token": csrf(client),
+        "video": (io.BytesIO(payload), "without-fight-weights.avi")},
+        content_type="multipart/form-data")
+    assert response.status_code == 302
+    video_id = response.location.rsplit("/", 1)[-1]
+    row = wait_for_status(app, video_id)
+    assert row["processing_status"] == "complete"
+    assert row["fight_analysis"]["status"] == "unavailable"
+    assert row["fight_analysis"]["candidate_event_count"] == 0
+    assert app.extensions["mongo_db"].detection_events.count_documents(
+        {"video_id": ObjectId(video_id), "event_type": "SUSPECTED_FIGHTING"}) == 0
+    assert b"not found" in client.get(response.location).data.lower()
+
+
+def test_startup_resumes_legacy_waiting_local_job(app, tmp_path):
+    from app.services.local_fallback import save_pending_upload, update_pending_video
+    payload_path = tmp_path / "startup-local.avi"
+    payload = make_video(payload_path)
+    stored = "a" * 32 + ".avi"
+    (Path(app.config["UPLOAD_DIR"]) / stored).write_bytes(payload)
+    document = {"original_filename": "startup-local.avi", "stored_filename": stored,
+                "file_path": stored, "file_size": len(payload), "processing_status": "queued",
+                "zones": [], "pose_analysis": {"status": "queued"},
+                "face_analysis": {"status": "queued"}, "object_analysis": {"status": "not_configured"}}
+    with app.app_context():
+        video_id, _job_id = save_pending_upload(document, "Atlas temporarily unavailable")
+        update_pending_video(video_id, {"processing_status": "waiting_for_mongodb",
+            "local_job.status": "waiting_for_mongodb"})
+
+    restarted = create_app({"TESTING": False, "SECRET_KEY": "startup-test", "MONGO_URI": "",
+        "MONGO_DB_NAME": "offline_startup", "MONGO_PING_ON_STARTUP": False,
+        "UPLOAD_DIR": app.config["UPLOAD_DIR"], "PROCESSED_DIR": str(tmp_path / "restart-processed"),
+        "LOCAL_FALLBACK_PATH": app.config["LOCAL_FALLBACK_PATH"],
+        "POSE_MODEL_PATH": "", "PROCESSING_WORKERS": 1, "PROCESSING_QUEUE_SIZE": 1,
+        "MAX_DURATION_SECONDS": 30, "SAMPLE_EVERY_SECONDS": .1})
+    try:
+        row = wait_for_local_status(restarted, video_id)
+        assert row["processing_status"] == "complete"
+        assert row["local_job"]["status"] == "completed"
+        assert restarted.test_client().get(f"/results/{video_id}").status_code == 200
+    finally:
+        restarted.extensions["processing_executor"].shutdown(wait=True, cancel_futures=True)
 
 
 def test_upload_persists_object_observations_tracks_summary_and_report(client, app, tmp_path, monkeypatch):
@@ -826,3 +1323,410 @@ def test_empty_video_upload_is_rejected_before_mongodb_insert(client, app):
         "video": (io.BytesIO(b""), "empty.mp4")}, content_type="multipart/form-data", follow_redirects=True)
     assert response.status_code == 200 and b"file is empty" in response.data
     assert app.extensions["mongo_db"].videos.count_documents({}) == 0
+
+
+def test_roi_is_optional_and_validates_normalized_coordinates():
+    assert parse_zones(None) == []
+    zone = {"zone_id": "zone_1", "name": "Restricted Area", "enabled": True,
+            "points": [[.1, .1], [.8, .1], [.8, .8], [.1, .8]]}
+    assert parse_zones(json.dumps([zone]))[0]["name"] == "Restricted Area"
+    for invalid in (
+        [{"points": [[.1, .1], [.2, .2]]}],
+        [{"points": [[-.1, .1], [.8, .1], [.8, .8]]}],
+        [{"points": [[.1, .1], [.1, .1], [.1, .1]]}],
+    ):
+        with pytest.raises(ZoneValidationError):
+            parse_zones(json.dumps(invalid))
+
+
+def test_roi_associates_localized_pose_candidate_with_inside_or_outside_zone():
+    zones = parse_zones([{"zone_id": "restricted", "name": "Restricted Area", "enabled": True,
+                          "points": [[.1, .1], [.6, .1], [.6, .9], [.1, .9]]}])
+    inside = {"event_type": "potential_fall", "details": {"person_bbox_xyxy": [20, 10, 40, 60]}}
+    outside = {"event_type": "potential_fall", "details": {"person_bbox_xyxy": [80, 10, 95, 60]}}
+    unavailable = {"event_type": "potential_fall", "details": {}}
+    assert associate_event_with_zones(inside, zones, 100, 100)["zone_association_status"] == "inside_active_zone"
+    assert associate_event_with_zones(inside, zones, 100, 100)["zone_matches"] == ["restricted"]
+    assert associate_event_with_zones(outside, zones, 100, 100)["zone_association_status"] == "outside_active_zones"
+    assert associate_event_with_zones(unavailable, zones, 100, 100)["zone_association_status"] == "unavailable_no_person_location"
+
+
+def test_roi_upload_persists_zone_and_reports_model_limitation(client, app, tmp_path):
+    payload = make_video(tmp_path / "roi-sample.avi")
+    zone = {"zone_id": "zone_1", "name": "Entry", "enabled": True,
+            "points": [[.1, .1], [.9, .1], [.9, .9], [.1, .9]]}
+    response = client.post("/upload", data={"csrf_token": csrf(client), "roi_zones": json.dumps([zone]),
+        "video": (io.BytesIO(payload), "roi-sample.avi")}, content_type="multipart/form-data")
+    assert response.status_code == 302
+    video_id = response.headers["Location"].rsplit("/", 1)[-1]
+    saved = wait_for_status(app, video_id)
+    assert saved["zones"] == [zone]
+    assert saved["zone_analysis"]["status"] == "unavailable"
+    result = client.get(response.location)
+    assert result.status_code == 200 and b"Smart surveillance zones" in result.data
+    assert b"pose model produced localized anomaly events" in result.data
+
+
+def test_roi_pipeline_checks_pose_candidate_and_annotates_derived_video(tmp_path):
+    class LocalizedFixture:
+        METHOD = "test pose localization"
+        def inspect(self, frame, timestamp):
+            return frame, {"event_type": "potential_fall", "timestamp_seconds": timestamp,
+                           "details": {"person_bbox_xyxy": [20, 10, 40, 35]}}
+
+    source = tmp_path / "roi-pipeline.avi"
+    payload = make_video(source)
+    zones = parse_zones([{"zone_id": "entry", "name": "Entry", "enabled": True,
+                          "points": [[.1, .1], [.6, .1], [.6, .9], [.1, .9]]}])
+    output = tmp_path / "roi-derived.webm"
+    result = analyze_video(str(source), .2, 30, LocalizedFixture(), output_path=str(output), zones=zones)
+    assert result["events"][0]["zone_association_status"] == "inside_active_zone"
+    assert result["events"][0]["zone_matches"] == ["entry"]
+    assert result["annotated_output"] is True
+    cap = cv2.VideoCapture(str(output))
+    try:
+        ok, frame = cap.read()
+        assert ok and frame is not None and frame.size
+    finally:
+        cap.release()
+
+
+def test_roi_candidate_is_persisted_as_zone_specific_when_pose_localizes_it(client, app, tmp_path, monkeypatch):
+    import app.routes.videos as video_routes
+    marker = tmp_path / "pose-weights-marker.pt"
+    marker.write_bytes(b"test only")
+    app.config["POSE_MODEL_PATH"] = str(marker)
+
+    class LocalizedFixture:
+        METHOD = "test pose localization"
+        def inspect_with_evidence(self, frame, timestamp):
+            event = {"event_type": "potential_fall", "timestamp_seconds": timestamp,
+                     "anomaly_score": .7, "confidence": None,
+                     "details": {"person_bbox_xyxy": [20, 10, 40, 35]}}
+            evidence = {"timestamp_seconds": timestamp, "person_count": 1, "people": [],
+                        "transition_status": "candidate_emitted"}
+            return frame, event, evidence
+
+    monkeypatch.setattr(video_routes, "YoloPoseFallDetector", lambda *_args, **_kwargs: LocalizedFixture())
+    payload = make_video(tmp_path / "localized.avi")
+    zone = {"zone_id": "entry", "name": "Entry", "enabled": True,
+            "points": [[.1, .1], [.6, .1], [.6, .9], [.1, .9]]}
+    response = client.post("/upload", data={"csrf_token": csrf(client), "roi_zones": json.dumps([zone]),
+        "video": (io.BytesIO(payload), "localized.avi")}, content_type="multipart/form-data")
+    video_id = response.headers["Location"].rsplit("/", 1)[-1]
+    row = wait_for_status(app, video_id)
+    event = app.extensions["mongo_db"].detection_events.find_one({"video_id": ObjectId(video_id)})
+    assert row["zone_analysis"]["status"] == "complete"
+    assert row["zone_analysis"]["events_inside_active_zones"] > 0
+    assert event["zone_association_status"] == "inside_active_zone" and event["zone_matches"] == ["entry"]
+    result = client.get(response.location)
+    assert b"Inside active zone: Entry" in result.data
+
+
+def test_invalid_roi_is_rejected_before_file_or_database_write(client, app, tmp_path):
+    payload = make_video(tmp_path / "bad-roi.avi")
+    before_files = set(os.listdir(app.config["UPLOAD_DIR"]))
+    bad = {"zone_id": "zone_1", "name": "Too small", "enabled": True,
+           "points": [[.1, .1], [.8, .8]]}
+    response = client.post("/upload", data={"csrf_token": csrf(client), "roi_zones": json.dumps([bad]),
+        "video": (io.BytesIO(payload), "bad-roi.avi")}, content_type="multipart/form-data", follow_redirects=True)
+    assert response.status_code == 200 and b"needs between 3 and 100 points" in response.data
+    assert set(os.listdir(app.config["UPLOAD_DIR"])) == before_files
+    assert app.extensions["mongo_db"].videos.count_documents({}) == 0
+
+
+def test_queued_job_is_claimed_once_and_moves_through_explicit_states(app):
+    from app.services.repository import update_job
+    with app.app_context():
+        job_id = create_job({"video_id": ObjectId(), "status": "queued", "created_at": datetime.now(timezone.utc)})
+        claimed = claim_job(str(job_id))
+        assert claimed and claimed["status"] == "processing"
+        assert claim_job(str(job_id)) is None
+        assert update_job(str(job_id), {"status": "completed", "progress_percent": 100})
+        assert app.extensions["mongo_db"].processing_jobs.find_one({"_id": job_id})["status"] == "completed"
+
+
+def test_completed_job_and_video_status_cannot_regress(app, client):
+    from app.services.repository import update_job
+    from app.services.local_fallback import save_pending_upload
+    with app.app_context():
+        video_id, job_id = save_pending_upload(video_doc("stable-status.mp4", "queued"), "test fallback")
+        assert claim_job(job_id)["status"] == "processing"
+        assert update_video(video_id, {"processing_status": "complete",
+                                       "analysis_summary": "Persisted results"})
+        assert update_job(job_id, {"status": "completed", "progress_percent": 100})
+        assert update_job(job_id, {"status": "processing"}) is False
+        assert update_job(job_id, {"status": "queued"}) is False
+        assert update_video(video_id, {"processing_status": "processing"}) is False
+        assert update_video(video_id, {"processing_status": "queued"}) is False
+    responses = [client.get(f"/api/videos/{video_id}/status").json for _ in range(4)]
+    assert [row["status"] for row in responses] == ["complete"] * 4
+    assert responses[-1]["progress"] == 100
+
+
+def test_status_api_does_not_trust_stale_completed_job_before_video_results(app, client):
+    with app.app_context():
+        video_id = create_video(video_doc("late-results.mp4", "processing"))
+        job_id = create_job({"video_id": video_id, "status": "completed", "progress_percent": 100})
+    result = client.get(f"/api/videos/{video_id}/status")
+    assert result.status_code == 200
+    assert result.json["status"] == "processing"
+
+
+def test_video_timestamp_format_and_legacy_event_fields():
+    from app.services.timestamps import event_video_seconds, format_video_timestamp
+    assert event_video_seconds({"timestamp_seconds": "2.4"}) == 2.4
+    assert event_video_seconds({"timestamp": 62.35}) == 62.35
+    assert event_video_seconds({"created_at": datetime.now(timezone.utc)}) is None
+    assert event_video_seconds({"timestamp_seconds": "nan", "timestamp": -1}) is None
+    assert format_video_timestamp(2.4) == "00:02.40"
+    assert format_video_timestamp(62.35) == "01:02.35"
+    assert format_video_timestamp(3661.2) == "01:01:01.20"
+    assert format_video_timestamp(float("inf")) is None
+
+
+def test_legacy_zone_time_renders_from_stored_numeric_timestamp(client, app):
+    with app.app_context():
+        video_id = create_video(video_doc("legacy-zone.avi", "complete"))
+        app.extensions["mongo_db"].detection_events.insert_one({
+            "video_id": video_id, "event_type": "RESTRICTED_ZONE_ENTRY",
+            "zone_name": "North gate", "track_id": 5, "timestamp": 2.4,
+            "details": {"zone_name": "North gate", "person_bbox_xyxy": [4, 5, 10, 30]},
+        })
+    response = client.get(f"/results/{video_id}")
+    assert response.status_code == 200
+    assert b"00:02.40" in response.data
+    history = client.get("/history")
+    assert b"Latest confirmed entry: 00:02.40" in history.data
+    incidents = client.get("/incidents")
+    assert b"00:02.40" in incidents.data
+
+
+def test_zone_entry_records_formatted_video_timestamp_and_crossing_box():
+    from app.services.video_processor import _zone_transition_events
+    zone = [{"zone_id": "gate", "name": "North Gate", "enabled": True,
+             "points": [[.3, .3], [.7, .3], [.7, .7], [.3, .7]]}]
+    def sample(t, frame, x1, x2):
+        return {"timestamp_seconds": t, "frame_number": frame, "people": [
+            {"track_id": 7, "bbox_xyxy": [x1, 10, x2, 50], "detection_confidence": .88}]}
+    rows = [sample(0, 0, 10, 20), sample(.5, 5, 10, 20),
+            sample(1.0, 10, 35, 45), sample(1.5, 15, 35, 45)]
+    entries = [event for event in _zone_transition_events(rows, zone, 100, 100)
+               if event["event_type"] == "RESTRICTED_ZONE_ENTRY"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["timestamp_seconds"] == 1.0 and entry["video_timestamp"] == "00:01.00"
+    assert entry["zone_id"] == "gate" and entry["zone_name"] == "North Gate"
+    assert entry["details"]["person_bbox_xyxy"] == [35, 10, 45, 50]
+    assert entry["details"]["crossing_bbox_xyxy"] == [35, 10, 45, 50]
+
+
+def test_initial_zone_occupancy_does_not_show_a_fabricated_entry_time(client, app):
+    with app.app_context():
+        video_id = create_video({**video_doc("occupancy.avi", "complete"), "zones": [
+            {"zone_id": "z", "name": "Loading bay", "enabled": True, "points": []}]})
+        app.extensions["mongo_db"].detection_events.insert_one({
+            "video_id": video_id, "event_type": "zone_presence_observed",
+            "timestamp_seconds": 1.25, "track_id": 2,
+            "label": "first observed inside", "details": {"zone_name": "Loading bay"}})
+    response = client.get(f"/results/{video_id}")
+    assert b"Initial occupancy \xe2\x80\x94 entry time not observed" in response.data
+    assert b"observed at 00:01.25" in response.data
+
+
+def test_incident_review_validates_event_and_status_and_is_local_only(client, app):
+    video_id = ObjectId()
+    app.extensions["mongo_db"].videos.insert_one({"_id": video_id, "original_filename": "review.avi"})
+    event_id = app.extensions["mongo_db"].detection_events.insert_one({
+        "video_id": video_id, "event_type": "potential_fall", "label": "Potential fall candidate",
+        "timestamp_seconds": 1.25, "anomaly_score": .61, "incident_status": "new",
+        "review_notes": "", "created_at": datetime.now(timezone.utc),
+    }).inserted_id
+    token = csrf(client)
+    response = client.post(f"/incidents/{event_id}/review", data={
+        "csrf_token": token, "status": "reviewing", "review_notes": "Check frame 12",
+        "next": "//attacker.example"})
+    assert response.status_code == 302 and response.headers["Location"].endswith("/incidents")
+    saved = app.extensions["mongo_db"].detection_events.find_one({"_id": event_id})
+    assert saved["incident_status"] == "reviewing" and saved["review_notes"] == "Check frame 12"
+    assert b"Potential fall candidate" in client.get("/incidents?status=reviewing").data
+    assert client.post(f"/incidents/{event_id}/review", data={
+        "csrf_token": token, "status": "confirmed", "review_notes": "invalid"}).status_code == 400
+    assert client.post(f"/incidents/{event_id}/review", data={
+        "csrf_token": token, "status": "resolved"}, environ_overrides={"REMOTE_ADDR": "10.0.0.8"}).status_code == 403
+    object_id = app.extensions["mongo_db"].detection_events.insert_one({
+        "video_id": video_id, "event_type": "object_detection", "label": "person"}).inserted_id
+    with app.app_context():
+        assert not update_incident(str(object_id), "resolved", "must not become incident")
+
+
+def test_restricted_zone_entry_persists_in_local_fallback_and_is_reviewable(app, client):
+    from app.services.local_fallback import save_pending_upload
+    from app.services.repository import save_events, list_incidents, get_events, list_videos
+    with app.app_context():
+        video_id, job_id = save_pending_upload(video_doc("local-zone.mp4", "queued"), "offline fixture")
+        entry = {"event_type": "RESTRICTED_ZONE_ENTRY", "label": "Entered north gate",
+                 "timestamp_seconds": 2.5, "confidence": .83, "anomaly_score": None,
+                 "track_id": 12, "detection_method": "YOLO pose + ByteTrack + polygon transition",
+                 "details": {"zone_id": "north", "zone_name": "North gate",
+                             "previously_confirmed_outside": True}}
+        assert save_events(video_id, job_id, [entry]) == 1
+        saved = get_events(video_id)
+        assert len(saved) == 1 and saved[0]["event_type"] == "RESTRICTED_ZONE_ENTRY"
+        assert saved[0]["incident_status"] == "new" and saved[0]["track_id"] == 12
+        incidents = list_incidents()
+        stored = next(row for row in incidents if str(row.get("_id")) == str(saved[0]["_id"]))
+        assert stored["details"]["zone_name"] == "North gate"
+        assert update_incident(str(stored["_id"]), "reviewing", "Check the doorway clip") is True
+        reviewed = next(row for row in list_incidents("reviewing") if str(row.get("_id")) == str(stored["_id"]))
+        assert reviewed["review_notes"] == "Check the doorway clip"
+        videos, _ = list_videos(search="local-zone")
+        assert videos[0]["event_count"] == 0
+        assert videos[0]["restricted_zone_entry_count"] == 1
+    assert b"RESTRICTED_ZONE_ENTRY" in client.get(f"/results/{video_id}").data
+    history_page = client.get("/history").data
+    assert b"local-zone.mp4" in history_page and b"1 restricted-zone entries" in history_page
+    assert b"local-zone.mp4" in client.get("/incidents?status=reviewing").data
+    assert b"RESTRICTED_ZONE_ENTRY" in client.get("/dashboard").data
+
+
+def test_restricted_zone_entry_persists_in_mongo_repository_and_dashboard(app):
+    from app.services.repository import save_events, list_incidents, list_videos
+    with app.app_context():
+        video_id = create_video(video_doc("mongo-zone.mp4", "complete"))
+        event = {"event_type": "RESTRICTED_ZONE_ENTRY", "label": "Entered loading bay",
+                 "timestamp_seconds": 4.0, "confidence": .76, "track_id": 9,
+                 "details": {"zone_id": "bay", "zone_name": "Loading bay"},
+                 "detection_method": "YOLO pose + ByteTrack + confirmed polygon transition"}
+        assert save_events(str(video_id), str(ObjectId()), [event]) == 1
+        stored = app.extensions["mongo_db"].detection_events.find_one({"video_id": video_id})
+        assert stored["event_type"] == "RESTRICTED_ZONE_ENTRY"
+        assert stored["incident_status"] == "new"
+        assert any(item["_id"] == stored["_id"] for item in list_incidents())
+        videos, _ = list_videos(search="mongo-zone")
+        assert videos[0]["event_count"] == 0
+        assert videos[0]["restricted_zone_entry_count"] == 1
+        stats = dashboard_stats()
+        assert stats["restricted_zone_entries"] == 1
+        assert stats["events"] == 0  # A zone entry is a review event, not an anomaly prediction.
+
+
+def test_result_timeline_handles_missing_or_invalid_timestamps(client, app):
+    with app.app_context():
+        video_id = create_video(video_doc("invalid-time.avi", "complete"))
+        app.extensions["mongo_db"].detection_events.insert_one({
+            "video_id": video_id, "event_type": "potential_fall", "label": "Potential fall candidate",
+            "timestamp_seconds": "not-a-number", "anomaly_score": .6,
+            "details": {}, "created_at": datetime.now(timezone.utc), "incident_status": "new"})
+    response = client.get(f"/results/{video_id}")
+    assert response.status_code == 200
+    assert b"Time unavailable" in response.data
+    assert b"disabled aria-disabled=\"true\"" in response.data
+
+
+def test_pdf_report_generation_with_and_without_events(client, app):
+    with app.app_context():
+        video_id = create_video({**video_doc("report (draft).avi", "complete"), "analysis_summary": "Validation only."})
+        app.extensions["mongo_db"].detection_events.insert_one({
+            "video_id": video_id, "event_type": "potential_fall", "label": "Candidate (review)",
+            "timestamp_seconds": 2.5, "anomaly_score": .72, "detection_method": "pose heuristic",
+            "details": {"previously_upright": True, "vertical_drop_fraction": .3,
+                        "torso_horizontal_ratio": 1.7, "horizontal_persistence_seconds": .8},
+            "incident_status": "reviewing", "review_notes": "Needs (manual) review",
+            "created_at": datetime.now(timezone.utc)})
+    empty_pdf = client.get(f"/results/{video_id}/report.pdf")
+    assert empty_pdf.status_code == 200 and empty_pdf.mimetype == "application/pdf"
+    assert empty_pdf.data.startswith(b"%PDF-1.4") and empty_pdf.data.endswith(b"%%EOF\n")
+    xref_offset = int(empty_pdf.data.rsplit(b"startxref\n", 1)[1].splitlines()[0])
+    assert empty_pdf.data[xref_offset:xref_offset + 4] == b"xref"
+    assert b"Candidate \\(review\\)" in empty_pdf.data
+    event = {"event_type": "potential_fall", "label": "Candidate (review)",
+             "timestamp_seconds": 2.5, "anomaly_score": .72, "detection_method": "pose heuristic",
+             "details": {"previously_upright": True, "vertical_drop_fraction": .3,
+                         "torso_horizontal_ratio": 1.7, "horizontal_persistence_seconds": .8},
+             "incident_status": "reviewing", "review_notes": "Needs (manual) review"}
+    pdf = build_pdf({"_id": video_id, "original_filename": "clip (one).avi",
+                     "processing_status": "complete"}, {"status": "completed"}, [event])
+    assert b"Candidate \\(review\\)" in pdf
+    assert b"score: 0.72" in pdf.lower()
+    assert b"Needs \\(manual\\) review" in pdf
+    assert b"connection string" not in pdf.lower()
+
+
+def test_pdf_report_empty_record_has_clear_zero_event_message(client, app):
+    with app.app_context():
+        video_id = create_video(video_doc("no-events.avi", "complete"))
+    response = client.get(f"/results/{video_id}/report.pdf")
+    assert response.status_code == 200
+    assert b"No event records were saved" in response.data
+
+
+def test_analysis_settings_parent_and_fight_child_update_without_mongo_path_conflict(app):
+    with app.app_context():
+        video_id = create_video({**video_doc("settings-merge.mp4", "processing"),
+                                 "analysis_settings": {"sample_every_seconds": .5,
+                                                       "pose_tracker": "bytetrack.yaml",
+                                                       "nested": {"keep": True}}})
+        assert update_video(str(video_id), {
+            "analysis_settings": {"zone_track_sample_seconds": .25,
+                                  "fight_score_threshold": .42},
+            "analysis_settings.fight_score_threshold": .47,
+        }) is True
+        saved = get_video(str(video_id))
+        assert saved["analysis_settings"] == {
+            "sample_every_seconds": .5,
+            "pose_tracker": "bytetrack.yaml",
+            "nested": {"keep": True},
+            "zone_track_sample_seconds": .25,
+            "fight_score_threshold": .47,
+        }
+
+
+def test_nested_analysis_setting_update_preserves_sibling_values(app):
+    with app.app_context():
+        video_id = create_video({**video_doc("settings-sibling.mp4", "processing"),
+                                 "analysis_settings": {"sampling": {"pose": .5, "fight": 1.0},
+                                                       "model": "x3d"}})
+        assert update_video(str(video_id), {"analysis_settings.sampling.pose": .25}) is True
+        saved = get_video(str(video_id))
+        assert saved["analysis_settings"] == {
+            "sampling": {"pose": .25, "fight": 1.0}, "model": "x3d"}
+
+
+def test_write_error_code_40_is_not_misreported_as_database_connectivity(app, monkeypatch):
+    from pymongo.errors import WriteError
+    import app.services.repository as repository
+
+    class BrokenCollection:
+        def update_one(self, *_args, **_kwargs):
+            raise WriteError("conflicting update paths", 40)
+
+    class BrokenDatabase:
+        videos = BrokenCollection()
+
+    with app.app_context():
+        app.extensions["mongo_available"] = True
+        monkeypatch.setattr(repository, "get_database", lambda: BrokenDatabase())
+        with pytest.raises(WriteError) as error:
+            update_video(str(ObjectId()), {"analysis_settings": {"fight_score_threshold": .5},
+                                            "analysis_settings.fight_score_threshold": .6})
+        assert error.value.code == 40
+        assert app.extensions["mongo_available"] is True
+        message = _friendly_connection_error(error.value)
+        assert "application update conflict" in message
+        assert "network" in message
+
+
+def test_status_api_distinguishes_database_outage_from_missing_video(app, client, monkeypatch):
+    import app.services.repository as repository
+
+    with app.app_context():
+        video_id = create_video(video_doc("status-outage.mp4", "complete"))
+    monkeypatch.setattr(repository, "get_database",
+                        lambda: (_ for _ in ()).throw(DatabaseUnavailable("temporary database outage")))
+    unavailable = client.get(f"/api/videos/{video_id}/status")
+    assert unavailable.status_code == 503
+    assert unavailable.json["status"] == "unavailable"
+    assert "temporary database outage" in unavailable.json["error"]
+    invalid = client.get("/api/videos/not-an-object-id/status")
+    assert invalid.status_code == 404

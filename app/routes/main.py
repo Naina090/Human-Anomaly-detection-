@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from app.services.repository import dashboard_stats
 from app.services.fall_detector import detector_status
 from app.services.object_detector import detector_status as object_detector_status
+from app.services.fight_detector import detector_status as fight_detector_status
 
 bp = Blueprint("main", __name__)
 
@@ -31,6 +32,8 @@ def dashboard():
     stats["detector"] = detector_status(current_app.config.get("POSE_MODEL_PATH", ""))
     stats["object_detector"] = object_detector_status(current_app.config.get("OBJECT_MODEL_PATH", ""),
                                                         current_app.config.get("OBJECT_TRACKER", "bytetrack.yaml"))
+    stats["fight_detector"] = fight_detector_status(current_app.config.get("FIGHT_MODEL_PATH", ""),
+        current_app.config.get("FIGHT_DETECTION_ENABLED", True))
     for event in stats["recent"]:
         event["id"] = str(event["_id"])
         event["timestamp"] = event.get("timestamp_seconds", 0)
