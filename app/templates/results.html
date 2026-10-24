@@ -1,5 +1,6 @@
 {% extends 'base.html' %}
-{% block title %}Analysis result | Sentinel{% endblock %}
+{% block title %}Analysis result | AnomaX AI{% endblock %}
+{% block meta_description %}Review saved video analysis evidence in AnomaX AI.{% endblock %}
 {% block content %}
 <div class="wrap page" id="analysis-result" data-video-id="{{ video.id }}" data-status-url="{{ url_for('videos.status', video_id=video.id) }}">
   <div class="page-heading"><div><div class="eyebrow">ANALYSIS RESULT / 03</div><h1>{{ video.original_name }}</h1><p>Run ID {{ video.id[:12] }} · Uploaded {{ video.uploaded_at }}</p></div><div class="actions"><a class="button quiet" href="{{ url_for('videos.video_report',video_id=video.id) }}">Download analysis CSV</a><a class="button quiet" href="{{ url_for('videos.video_report_pdf',video_id=video.id) }}">Download PDF report</a><a class="button quiet" href="{{ url_for('incidents.incident_list') }}">Review incidents</a><button class="button quiet" type="button" onclick="window.print()">Print / Save PDF</button><a class="button secondary" href="/history">← History</a></div></div>

@@ -1,0 +1,14 @@
+.brand-mark svg{width:21px;height:21px;fill:none;stroke:#041521;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.brand-sub{white-space:nowrap}
+.footer{border-top:1px solid #1c2a3b;padding:28px max(calc((100vw - 1132px)/2),5%);display:flex;align-items:center;justify-content:space-between;gap:28px;color:#b1c0ce;font-size:11px}
+.footer-brand .brand{font-size:16px}
+.footer-brand .brand-mark{width:31px;height:31px}
+.footer-brand .brand-sub{font-size:7px;letter-spacing:1px}
+.footer-brand p{margin:12px 0 5px;color:#a9bbcd;font-size:11px}
+.footer-brand small{color:#73859a;font-size:10px}
+.footer-links{display:flex;flex-wrap:wrap;gap:18px}
+.footer-links a{color:#a6b5c8;font-size:11px}
+.footer-links a:hover{color:#fff}
+.footer-note{color:#73859a;font-size:10px;text-align:right}
+.home-tagline{color:var(--blue);font-weight:700}
+@media(max-width:650px){.footer{display:flex;flex-direction:column;align-items:flex-start;gap:17px;padding:24px 18px;line-height:1.7}.footer-note{text-align:left}.footer-links{gap:16px}}

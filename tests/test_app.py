@@ -62,6 +62,26 @@ def client(app):
     return app.test_client()
 
 
+def test_anomax_branding_renders_across_shared_website_pages(client, app):
+    assert client.get("/static/css/branding.css").status_code == 200
+    paths = ["/", "/dashboard", "/upload", "/history", "/incidents", "/reports", "/about"]
+    with app.app_context():
+        video_id = str(create_video(video_doc("brand-check.mp4", status="completed")))
+    paths.append(f"/results/{video_id}")
+    for path in paths:
+        response = client.get(path)
+        assert response.status_code == 200, path
+        page = response.get_data(as_text=True)
+        assert "AnomaX AI" in page, path
+        assert "Detect Patterns. Discover Anomalies." in page, path
+        assert "INTELLIGENT HUMAN ANOMALY DETECTION SYSTEM" in page, path
+        assert "© 2026 AnomaX AI. All rights reserved." in page, path
+        assert "Sentinel" not in page, path
+        assert 'href="/upload">Upload</a>' in page, path
+        assert 'href="/history">History</a>' in page, path
+        assert 'href="/reports">Reports</a>' in page, path
+
+
 def csrf(client):
     client.get("/upload")
     with client.session_transaction() as session:
