@@ -307,7 +307,7 @@ def _deliver_one(app, notification_id):
         ready, reason = smtp_configuration(app.config)
         if not ready:
             try:
-                update_video_alert(notification_id, {"status": "disabled", "failure_reason": reason})
+                update_video_alert(notification_id, {"status": "skipped", "failure_reason": reason})
             except Exception:
                 log.exception("Could not persist disabled consolidated email alert status.")
             return False
@@ -353,11 +353,28 @@ def _deliver_one(app, notification_id):
                     transmission_started = True
                 _send(app.config, msg, before_transmission=mark_transmission)
                 smtp_seconds = time.perf_counter() - smtp_started
-                update_video_alert(notification_id, {"status": "sent", "sent_at": datetime.now(timezone.utc),
+                # send_message returned, so SMTP accepted the message. Retry
+                # only the durable status write here; never resend the email.
+                sent_changes = {"status": "sent", "sent_at": datetime.now(timezone.utc),
                     "last_attempt_at": datetime.now(timezone.utc), "failure_reason": None,
                     "gif_filename": os.path.basename(gif_path), "gif_size_bytes": gif["size_bytes"],
                     "gif_duration_seconds": gif["duration_seconds"], "gif_source": gif["source"],
-                    "gif_generation_seconds": gif_seconds, "smtp_delivery_seconds": smtp_seconds})
+                    "gif_generation_seconds": gif_seconds, "smtp_delivery_seconds": smtp_seconds}
+                status_saved = False
+                for persist_attempt in range(1, 4):
+                    try:
+                        status_saved = bool(update_video_alert(notification_id, sent_changes))
+                    except Exception as persist_exc:
+                        log.error("SMTP accepted alert %s but final status write attempt %s failed (%s).",
+                                  str(notification_id)[:8], persist_attempt, type(persist_exc).__name__)
+                    if status_saved:
+                        break
+                    if persist_attempt < 3:
+                        time.sleep(0.1 * persist_attempt)
+                if not status_saved:
+                    log.error("SMTP accepted alert %s, but Sent could not be confirmed in persistent storage; no resend was attempted.",
+                              str(notification_id)[:8])
+                    return False
                 return True
             except Exception as exc:
                 last_reason = ("SMTP delivery outcome is uncertain; automatic resend was suppressed."
@@ -405,7 +422,7 @@ def _configured_alerts(app):
         from app.services.repository import list_pending_video_alerts
         for notification in list_pending_video_alerts(limit=1000):
             try:
-                update_video_alert(notification["notification_id"], {"status": "disabled", "failure_reason": reason})
+                update_video_alert(notification["notification_id"], {"status": "skipped", "failure_reason": reason})
             except Exception:
                 log.exception("Could not persist disabled video alert state.")
         return []
@@ -420,7 +437,7 @@ def schedule_pending_alerts(app, video_id=None):
         pending = list_pending_video_alerts(video_id, limit=1000)
         for notification in pending:
             try:
-                update_video_alert(notification["notification_id"], {"status": "disabled", "failure_reason": reason})
+                update_video_alert(notification["notification_id"], {"status": "skipped", "failure_reason": reason})
             except Exception:
                 log.exception("Could not update disabled alert status.")
         return

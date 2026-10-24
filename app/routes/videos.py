@@ -8,9 +8,10 @@ import hashlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 from flask import Blueprint, current_app, render_template, request, redirect, url_for, flash, send_file, abort, jsonify, Response
 from werkzeug.utils import secure_filename
-from app.services.repository import (create_video, get_video, get_events, update_video,
+from app.services.repository import (create_video, find_video_by_upload_request, get_video, get_events, update_video,
     create_job, update_job, get_job_for_video, get_face_frames, save_face_frames,
     get_pose_frames, save_pose_frames, claim_job)
 from app.db import DatabaseUnavailable
@@ -34,9 +35,55 @@ log = logging.getLogger(__name__)
 ALLOWED = {"mp4", "avi", "mov", "mkv"}
 
 
+def group_object_observations(events):
+    """Summarize sampled object observations by temporary tracker ID.
+
+    Records without a tracker ID remain separate single observations so they
+    are never presented as one inferred object or person.
+    """
+    groups = {}
+    for index, event in enumerate(events):
+        if event.get("event_type") != "object_detection":
+            continue
+        track_id = event.get("track_id", event.get("track"))
+        key = ("track", str(track_id)) if track_id is not None else (
+            "untracked", str(event.get("_id", index)), index)
+        summary = groups.get(key)
+        if summary is None:
+            summary = {"track_id": track_id, "labels": set(), "observation_count": 0,
+                       "timestamps": []}
+            groups[key] = summary
+        label = str(event.get("label") or "Unknown object")
+        summary["labels"].add(label)
+        summary["observation_count"] += 1
+        timestamp = event_video_seconds(event)
+        if timestamp is not None:
+            summary["timestamps"].append(timestamp)
+
+    output = []
+    for summary in groups.values():
+        labels = sorted(summary["labels"])
+        timestamps = summary.pop("timestamps")
+        first = min(timestamps) if timestamps else None
+        last = max(timestamps) if timestamps else None
+        summary["object_class"] = labels[0] if len(labels) == 1 else "Class varied: " + ", ".join(labels)
+        summary["first_seen_seconds"] = first
+        summary["last_seen_seconds"] = last
+        summary["first_seen_label"] = format_video_timestamp(first) if first is not None else "Time unavailable"
+        summary["last_seen_label"] = format_video_timestamp(last) if last is not None else "Time unavailable"
+        summary["track_label"] = str(summary["track_id"]) if summary["track_id"] is not None else "Unavailable"
+        output.append(summary)
+    return sorted(output, key=lambda item: (
+        item["first_seen_seconds"] is None,
+        item["first_seen_seconds"] if item["first_seen_seconds"] is not None else 0,
+        item["track_id"] is None,
+        str(item["track_id"] or ""), item["object_class"]))
+
+
 @bp.get("/upload")
 def upload_page():
     return render_template("upload.html", max_mb=current_app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024),
+                           upload_request_id=uuid.uuid4().hex,
                            detector=detector_status(current_app.config.get("POSE_MODEL_PATH", "")),
                            face_detector=face_detector_status(current_app.config.get("FACE_CASCADE_PATH", "")),
                            object_detector=object_detector_status(
@@ -60,6 +107,16 @@ def upload():
     except ZoneValidationError as exc:
         flash(str(exc), "error")
         return redirect(url_for("videos.upload_page"))
+    upload_request_id = request.form.get("upload_request_id", "")
+    try:
+        upload_request_id = uuid.UUID(hex=upload_request_id).hex
+    except (ValueError, AttributeError):
+        # Older/API clients without the field remain compatible; browser forms
+        # receive one fresh key per rendered upload page.
+        upload_request_id = uuid.uuid4().hex
+    existing = find_video_by_upload_request(upload_request_id)
+    if existing:
+        return redirect(url_for("videos.results", video_id=str(existing["_id"])))
     video_id = uuid.uuid4().hex
     stored = video_id + "." + ext
     path = os.path.join(current_app.config["UPLOAD_DIR"], stored)
@@ -91,6 +148,7 @@ def upload():
                   type(exc).__name__, sanitized_traceback(exc, current_app.config))
         raise
     document = {
+        "upload_request_id": upload_request_id,
         "original_filename": clean,
         "stored_filename": stored,
         "file_path": stored,
@@ -122,10 +180,23 @@ def upload():
     }
     try:
         record_id = create_video(document)
+    except DuplicateKeyError:
+        existing = find_video_by_upload_request(upload_request_id)
+        if os.path.isfile(path):
+            os.remove(path)
+        if existing:
+            return redirect(url_for("videos.results", video_id=str(existing["_id"])))
+        raise
     except DatabaseUnavailable as exc:
         try:
             from app.services.local_fallback import save_pending_upload
             record_id, job_id = save_pending_upload(document, str(exc))
+            from app.services.local_fallback import get_pending_video
+            saved_local = get_pending_video(record_id) or {}
+            if saved_local.get("stored_filename") != stored:
+                if os.path.isfile(path):
+                    os.remove(path)
+                return redirect(url_for("videos.results", video_id=record_id))
             app = current_app._get_current_object()
             if not app.extensions["processing_slots"].acquire(blocking=False):
                 from app.services.local_fallback import fail_pending_video
@@ -684,12 +755,15 @@ def results(video_id):
         event["zone_names"] = [zone_names.get(zone_id, zone_id) for zone_id in event.get("zone_matches", [])]
         event["id"] = str(event.get("_id", ""))
         event["explanation"] = explain_event(event)
+    object_observations = [event for event in events if event.get("event_type") == "object_detection"]
+    object_tracks = group_object_observations(object_observations)
     event_types = sorted({event.get("event_type", "unknown") for event in events})
     event_labels = sorted({event["label"] for event in events if event.get("label")})
     event_tracks = sorted({str(event["track_id"]) for event in events if event.get("track_id") is not None})
     return render_template("results.html", video=video, events=events, face_frames=face_frames,
                            pose_frames=pose_frames,
                            event_types=event_types, event_labels=event_labels, event_tracks=event_tracks,
+                           object_observations=object_observations, object_tracks=object_tracks,
                            event_limit_reached=len(events) >= 2000)
 
 
@@ -698,6 +772,7 @@ def alert_status(video_id):
     """Return saved alert status; only stale, already-reserved safe retries may resume."""
     if not ObjectId.is_valid(video_id):
         abort(404)
+    from app.services.notifier import smtp_configuration
     from app.services.repository import recover_video_alerts
     try:
         recovered = recover_video_alerts(
@@ -707,27 +782,53 @@ def alert_status(video_id):
             schedule_pending_alerts(current_app._get_current_object(), video_id)
     except Exception as exc:
         log.warning("Could not reconcile email status for video %s (%s).", video_id[:8], type(exc).__name__)
-    video = get_video(video_id)
+    try:
+        video = get_video(video_id)
+    except DatabaseUnavailable as exc:
+        return jsonify({"error": str(exc), "delivery_status": "unavailable",
+                        "notifications": []}), 503
     if not video:
         abort(404)
     notifications = []
     for item in video.get("email_alert_notifications", []):
         episodes = item.get("episodes") or []
+        episode_summaries = []
+        for episode in episodes:
+            intervals = episode.get("intervals") or []
+            interval_labels = []
+            for bounds in intervals:
+                if isinstance(bounds, (list, tuple)) and len(bounds) == 2:
+                    try:
+                        interval_labels.append(f"{format_video_timestamp(float(bounds[0]))}–{format_video_timestamp(float(bounds[1]))}")
+                    except (TypeError, ValueError):
+                        continue
+            timestamp = episode.get("timestamp_seconds")
+            label = ", ".join(interval_labels) if interval_labels else format_video_timestamp(timestamp)
+            episode_summaries.append({"event_type": str(episode.get("event_type", "candidate")),
+                                      "time_label": label or "Time unavailable"})
         notifications.append({
-            "status": item.get("status", "pending"),
+            # Keep the historical database value compatible while presenting
+            # the user-facing state as Skipped.
+            "status": "skipped" if item.get("status") == "disabled" else item.get("status", "pending"),
             "sent_at": item.get("sent_at").isoformat() if hasattr(item.get("sent_at"), "isoformat") else item.get("sent_at"),
             "last_attempt_at": item.get("last_attempt_at").isoformat() if hasattr(item.get("last_attempt_at"), "isoformat") else item.get("last_attempt_at"),
             "failure_reason": item.get("failure_reason"),
             "gif_available": bool(item.get("gif_filename")),
             "categories": sorted({str(ep.get("event_type", "candidate")) for ep in episodes}),
+            "episode_summaries": episode_summaries,
             "episode_count": len(episodes),
         })
     sent_count = sum(item.get("status") == "sent" for item in notifications)
+    ready, readiness_message = smtp_configuration(current_app.config)
+    delivery_status = (notifications[-1]["status"] if notifications else
+                       ("pending" if ready else "skipped"))
     return jsonify({"notifications": notifications,
                     "reserved_count": len(notifications),
                     "sent_count": sent_count,
                     "maximum": 2,
-                    "limit_reached": bool(video.get("alert_email_limit_reached"))})
+                    "limit_reached": bool(video.get("alert_email_limit_reached")),
+                    "delivery_status": delivery_status,
+                    "status_message": readiness_message if not ready else None})
 
 
 @bp.get("/results/<video_id>/report.csv")

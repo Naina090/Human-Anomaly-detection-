@@ -144,27 +144,29 @@ if(root){
 
 const alertPanel=document.querySelector('.alert-live-status[data-alert-url]');
 if(alertPanel){
-  const reserved=alertPanel.querySelector('.alert-reserved-count'),overview=document.querySelector('.overview-email-status'),summary=alertPanel.querySelector('.alert-live-summary'),list=alertPanel.querySelector('.alert-live-list');
-  const terminal=new Set(['sent','failed','uncertain','disabled']);
+  const reserved=alertPanel.querySelector('.alert-reserved-count'),overview=document.querySelector('.overview-email-status'),summary=alertPanel.querySelector('.alert-live-summary'),list=alertPanel.querySelector('.alert-live-list'),detail=alertPanel.querySelector('.alert-live-detail');
+  const terminal=new Set(['sent','failed','uncertain','skipped']);
   let alertBusy=false,alertAttempts=0,alertTimer=null;
   async function refreshAlerts(){
     if(alertBusy||alertAttempts>=96)return;
     alertBusy=true;alertAttempts++;
     try{
       const response=await fetch(alertPanel.dataset.alertUrl,{headers:{Accept:'application/json'},cache:'no-store'});
-      if(!response.ok)throw new Error('status unavailable');
+      if(!response.ok)throw new Error(`HTTP ${response.status}`);
       const data=await response.json();
+      const notifications=data.notifications||[];
       if(reserved)reserved.textContent=String(data.reserved_count||0);
-      const states=(data.notifications||[]).map(x=>x.status||'pending');
-      if(!states.length)return;
+      const states=notifications.map(item=>item.status==='disabled'?'skipped':(item.status||'pending'));
+      const state=data.delivery_status||states[states.length-1]||'skipped';
       const title=value=>(value||'pending').replaceAll('_',' ').replace(/\b\w/g,c=>c.toUpperCase());
-      if(summary)summary.textContent=states.length?title(states[states.length-1]):'Not queued';
-      if(overview&&states.length)overview.textContent=title(states[states.length-1]);
+      if(summary)summary.textContent=title(state);
+      if(overview)overview.textContent=title(state);
+      if(detail)detail.textContent=data.status_message||'';
       if(list){list.replaceChildren();(data.notifications||[]).forEach(item=>{const li=document.createElement('li');const categories=(item.categories||[]).map(value=>value==='SUSPECTED_FIGHTING'?'Suspected Violence-Related Activity':value.replaceAll('_',' ')).join(', ');li.textContent=`${title(item.status)}${categories?` · ${categories}`:''}${item.failure_reason?` — ${item.failure_reason}`:''}`;list.appendChild(li)})}
-      if(states.length&&states.every(status=>terminal.has(status)))return;
-    }catch(_){/* Keep the last persisted display; no delivery action is triggered here. */}
+      if(terminal.has(state))return;
+    }catch(_){if(detail)detail.textContent='Delivery status could not be refreshed; showing the last saved status and retrying.';}
     finally{alertBusy=false}
-    alertTimer=setTimeout(refreshAlerts,10000);
+    alertTimer=setTimeout(refreshAlerts,5000);
   }
   refreshAlerts();
 }

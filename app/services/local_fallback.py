@@ -10,6 +10,7 @@ import tempfile
 from datetime import datetime, timezone
 from threading import RLock
 from bson import ObjectId
+from app.services.timestamps import utc_datetime_sort_key
 
 class _FallbackLock:
     """Serialize fallback reads/writes both between threads and processes."""
@@ -102,6 +103,12 @@ def save_pending_upload(video, error):
     """Persist a validated local upload and a real local background job."""
     with _lock:
         rows = _read()
+        request_id = str(video.get("upload_request_id") or "")
+        if request_id:
+            existing = next((row for row in rows if row.get("upload_request_id") == request_id), None)
+            if existing:
+                job = existing.get("local_job") or {}
+                return existing["_id"], job.get("_id") or existing.get("active_job_id")
         identifier = str(ObjectId())
         job_id = str(ObjectId())
         now = datetime.now(timezone.utc)
@@ -122,6 +129,11 @@ def save_pending_upload(video, error):
 def get_pending_video(identifier):
     with _lock:
         return next((row for row in _read() if row.get("_id") == str(identifier)), None)
+
+
+def find_pending_video_by_upload_request(request_id):
+    with _lock:
+        return next((row for row in _read() if row.get("upload_request_id") == str(request_id)), None)
 
 
 def update_pending_video(identifier, changes):
@@ -332,7 +344,7 @@ def reserve_local_video_alert(identifier, notification, *, enabled, legacy_sent_
             return None, "limit_reached"
         now = datetime.now(timezone.utc)
         record = {**notification, "video_id": str(identifier),
-                  "status": "pending" if enabled else "disabled", "attempts": 0,
+                  "status": "pending" if enabled else "skipped", "attempts": 0,
                   "queued_at": now, "last_attempt_at": None, "sent_at": None,
                   "failure_reason": None if enabled else "Email alerts are disabled in configuration."}
         existing.append(record)
@@ -563,7 +575,8 @@ def list_pending_videos(search="", status="", page=1, per_page=25):
         rows = [row for row in rows if search.lower() in row.get("original_filename", "").lower()]
     if status:
         rows = [row for row in rows if row.get("processing_status") == status]
-    rows.sort(key=lambda row: row.get("upload_date", ""), reverse=True)
+    rows.sort(key=lambda row: (utc_datetime_sort_key(row.get("upload_date")),
+                               str(row.get("_id", ""))), reverse=True)
     return rows[(page - 1) * per_page:page * per_page], len(rows)
 
 

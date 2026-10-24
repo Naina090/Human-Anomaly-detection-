@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 import importlib.util
 from importlib.metadata import PackageNotFoundError, version
 import os
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -17,6 +18,17 @@ SUPPORTED_CLASSES = {
     "backpack", "handbag", "suitcase",
 }
 METHOD = "Ultralytics YOLO COCO detector + ByteTrack"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_model_path(model_path):
+    """Resolve configured relative model paths from the project, not CWD."""
+    if not model_path:
+        return ""
+    path = Path(os.path.expanduser(os.fspath(model_path)))
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return str(path.resolve())
 
 
 class ObjectDetectorUnavailable(RuntimeError):
@@ -31,7 +43,8 @@ def detector_status(model_path="", tracker="bytetrack.yaml"):
     if importlib.util.find_spec("ultralytics") is None:
         return {"configured": True, "ready": False, "status": "unavailable",
                 "method": METHOD, "message": "Object detector package unavailable. Install requirements-ai.txt."}
-    if not os.path.isfile(os.path.expanduser(model_path)):
+    model_path = resolve_model_path(model_path)
+    if not os.path.isfile(model_path):
         return {"configured": True, "ready": False, "status": "unavailable",
                 "method": METHOD, "message": "Configured object model file was not found. The app does not download weights automatically."}
     return {"configured": True, "ready": True, "status": "ready", "method": METHOD,
@@ -64,7 +77,7 @@ class YoloObjectTracker:
     METHOD = METHOD
 
     def __init__(self, model_path, confidence=0.25, tracker="bytetrack.yaml"):
-        model_path = os.path.abspath(os.path.expanduser(model_path)) if model_path else ""
+        model_path = resolve_model_path(model_path)
         if not model_path or not os.path.isfile(model_path):
             raise ObjectDetectorUnavailable("Set OBJECT_MODEL_PATH to an existing local object-detection weights file.")
         if importlib.util.find_spec("ultralytics") is None:
@@ -153,7 +166,7 @@ class YoloObjectTracker:
             label = observation["label"]
             color = colors.get(label, (60, 210, 230))
             cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
-            track = f" ID {observation['track_id']}" if observation.get("track_id") is not None and label == "person" else ""
+            track = f" ID {observation['track_id']}" if observation.get("track_id") is not None else ""
             caption = f"{label} {observation['confidence']:.2f}{track}"
             cv2.putText(output, caption, (x1, max(16, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX,
                         0.48, color, 1, cv2.LINE_AA)

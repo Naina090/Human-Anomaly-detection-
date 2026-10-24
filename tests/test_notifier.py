@@ -143,8 +143,10 @@ def _local_notification(app, video_id, notification_id=None):
                      if notification_id is None or item.get("notification_id") == notification_id), None)
 
 
-def test_alerts_disabled_and_missing_smtp_credentials_are_clear(alert_app):
+def test_alerts_disabled_and_missing_smtp_credentials_are_clear(alert_app, tmp_path):
     assert notifier.smtp_configuration(alert_app.config) == (False, "Email alerts are disabled in configuration.")
+    video_id, _event_id, _source = _local_video(alert_app, tmp_path)
+    assert _local_notification(alert_app, video_id)["status"] == "skipped"
     alert_app.config.update({"EMAIL_ALERTS_ENABLED": True})
     ready, reason = notifier.smtp_configuration(alert_app.config)
     assert not ready and "SMTP host" in reason
@@ -206,6 +208,30 @@ def test_local_fallback_consolidated_delivery_with_one_gif(alert_app, tmp_path, 
     assert b"Automated signals require human review" in messages[0]
     assert b"Analysis identifier" in messages[0]
     assert b"North gate" in messages[0]
+
+
+def test_smtp_acceptance_retries_only_status_persistence_without_resending(
+        alert_app, tmp_path, smtp_sink, monkeypatch):
+    from app.services import repository
+    port, messages = smtp_sink
+    _configure_smtp(alert_app, port)
+    video_id, _event_id, _source = _local_video(alert_app, tmp_path)
+    notification_id = _local_notification(alert_app, video_id)["notification_id"]
+    real_update = repository.update_video_alert
+    transient = {"remaining": 1}
+
+    def flaky_status_write(identifier, changes):
+        if changes.get("status") == "sent" and transient["remaining"]:
+            transient["remaining"] -= 1
+            raise RuntimeError("temporary persistence failure")
+        return real_update(identifier, changes)
+
+    monkeypatch.setattr(repository, "update_video_alert", flaky_status_write)
+    assert notifier._deliver_one(alert_app, notification_id)
+    saved = _local_notification(alert_app, video_id, notification_id)
+    assert saved["status"] == "sent"
+    assert transient["remaining"] == 0
+    assert len(messages) == 1  # retrying the database write never resends SMTP
 
 
 def test_test_email_uses_loopback_smtp_without_incident(alert_app, smtp_sink):

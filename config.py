@@ -38,8 +38,11 @@ class Config:
     FALL_MIN_VERTICAL_DROP = float(os.getenv("FALL_MIN_VERTICAL_DROP", "0.12"))
     FALL_MIN_HORIZONTAL_PERSISTENCE = float(os.getenv("FALL_MIN_HORIZONTAL_PERSISTENCE", "0.6"))
     FALL_CANDIDATE_SCORE_THRESHOLD = float(os.getenv("FALL_CANDIDATE_SCORE_THRESHOLD", "0.55"))
-    # Object detection is opt-in and only loads an existing local weight file.
-    OBJECT_MODEL_PATH = os.getenv("OBJECT_MODEL_PATH", "").strip()
+    # Object detection uses a project-relative local weight file by default.
+    # The detector never downloads weights during Flask startup or a request.
+    OBJECT_MODEL_PATH = os.getenv("OBJECT_MODEL_PATH", "models/yolo26n.pt").strip() or "models/yolo26n.pt"
+    if not Path(OBJECT_MODEL_PATH).is_absolute():
+        OBJECT_MODEL_PATH = str((BASE_DIR / OBJECT_MODEL_PATH).resolve())
     OBJECT_MODEL_CONFIDENCE = float(os.getenv("OBJECT_MODEL_CONFIDENCE", "0.25"))
     OBJECT_TRACKER = os.getenv("OBJECT_TRACKER", "bytetrack.yaml").strip() or "bytetrack.yaml"
     # Optional temporal violence-activity model. Empty keeps fighting analysis

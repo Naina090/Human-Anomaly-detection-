@@ -1,5 +1,29 @@
 """Safe conversion and formatting for positions inside a video."""
 import math
+from datetime import datetime, timezone
+
+
+def utc_datetime_sort_key(value):
+    """Normalize stored BSON datetimes and legacy ISO strings for chronology.
+
+    Naive legacy values are treated as UTC, matching the application's prior
+    timestamp writes. Invalid or absent values sort behind dated uploads.
+    """
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return float("-inf")
+    else:
+        return float("-inf")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc).timestamp()
+    except (OverflowError, OSError, ValueError):
+        return float("-inf")
 
 
 def event_video_seconds(event):

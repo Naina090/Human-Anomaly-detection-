@@ -4,7 +4,7 @@ import re
 import time
 import hashlib
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -13,7 +13,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import ConfigurationError, ConnectionFailure, PyMongoError
 from flask import current_app
 from app.db import DatabaseUnavailable, _friendly_connection_error, get_database
-from app.services.timestamps import event_video_seconds
+from app.services.timestamps import event_video_seconds, utc_datetime_sort_key
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +49,22 @@ def _run(fn):
 
 def create_video(document):
     return _run(lambda db: db.videos.insert_one(document).inserted_id)
+
+
+def find_video_by_upload_request(request_id):
+    """Find a prior submission by its per-form idempotency key."""
+    request_id = str(request_id or "")[:80]
+    if not request_id:
+        return None
+    from app.services.local_fallback import find_pending_video_by_upload_request
+    local = find_pending_video_by_upload_request(request_id)
+    if local and local.get("local_only"):
+        return local
+    try:
+        row = _run(lambda db: db.videos.find_one({"upload_request_id": request_id}))
+    except DatabaseUnavailable:
+        return local
+    return row or local
 
 
 def create_job(document):
@@ -384,7 +400,7 @@ def reserve_video_alert(video_id, notification, *, enabled, legacy_sent_count=0)
         db.videos.update_one({"_id": oid}, {"$max": {
             "alert_email_slots_used": min(2, max(0, int(legacy_sent_count or 0)))}})
         record = {**notification, "video_id": oid,
-                  "status": "pending" if enabled else "disabled", "attempts": 0,
+                  "status": "pending" if enabled else "skipped", "attempts": 0,
                   "queued_at": now, "last_attempt_at": None, "sent_at": None,
                   "failure_reason": None if enabled else "Email alerts are disabled in configuration."}
         query = {"_id": oid, "alert_reported_group_ids": {"$nin": group_ids},
@@ -898,11 +914,26 @@ def list_videos(search="", status="", page=1, per_page=25):
                         "superseded": {"$ne": True}, "event_type": "SUSPECTED_FIGHTING"}},
             {"$group": {"_id": "$video_id", "count": {"$sum": 1}}},
         ])} if docs else {}
+        event_type_summaries = defaultdict(list)
+        if docs:
+            for row in db.detection_events.aggregate([
+                {"$match": {"video_id": {"$in": [doc["_id"] for doc in docs]},
+                            "superseded": {"$ne": True}, "event_type": {"$ne": "object_detection"}}},
+                {"$group": {"_id": {"video_id": "$video_id",
+                                      "event_type": {"$ifNull": ["$event_type", "unknown"]},
+                                      "review_status": {"$ifNull": ["$incident_status", "not reviewed"]}},
+                            "count": {"$sum": 1}}},
+                {"$sort": {"_id.event_type": 1, "_id.review_status": 1}},
+            ]):
+                event_type_summaries[row["_id"]["video_id"]].append({
+                    "event_type": row["_id"]["event_type"],
+                    "review_status": row["_id"]["review_status"], "count": row["count"]})
         for doc in docs:
             doc["event_count"] = event_counts.get(doc["_id"], 0)
             doc["restricted_zone_entry_count"] = entry_counts.get(doc["_id"], 0)
             doc["latest_restricted_zone_entry"] = latest_entries.get(doc["_id"])
             doc["suspected_fighting_count"] = fighting_counts.get(doc["_id"], 0)
+            doc["event_type_summary"] = event_type_summaries.get(doc["_id"], [])
         return docs, total
     try:
         docs, total = _run(find)
@@ -914,6 +945,14 @@ def list_videos(search="", status="", page=1, per_page=25):
         excluded = {"object_detection", "zone_presence_observed", "zone_entry", "zone_exit", "zone_tracking_gap", "RESTRICTED_ZONE_ENTRY"}
         row["event_count"] = sum(event.get("event_type") not in excluded
                                   for event in row.get("local_events", []))
+        local_summary = Counter(
+            (str(event.get("event_type") or "unknown"),
+             str(event.get("incident_status") or "not reviewed"))
+            for event in row.get("local_events", [])
+            if event.get("superseded") is not True and event.get("event_type") != "object_detection")
+        row["event_type_summary"] = [{"event_type": event_type,
+                                      "review_status": review_status, "count": count}
+                                     for (event_type, review_status), count in sorted(local_summary.items())]
         row["restricted_zone_entry_count"] = sum(event.get("event_type") == "RESTRICTED_ZONE_ENTRY"
                                                   and event.get("superseded") is not True
                                                   for event in row.get("local_events", []))
@@ -926,7 +965,8 @@ def list_videos(search="", status="", page=1, per_page=25):
                                                and event.get("superseded") is not True
                                                for event in row.get("local_events", []))
     merged = docs + local
-    merged.sort(key=lambda row: str(row.get("upload_date", "")), reverse=True)
+    merged.sort(key=lambda row: (utc_datetime_sort_key(row.get("upload_date")),
+                                 str(row.get("_id", ""))), reverse=True)
     offset = (page - 1) * per_page
     return merged[offset:offset + per_page], total + local_total
 

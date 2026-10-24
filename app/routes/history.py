@@ -1,9 +1,11 @@
 import os
+import math
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from bson import ObjectId
 from flask import Blueprint, current_app, render_template, request, redirect, url_for, flash, abort
 from app.services.repository import (list_videos, delete_video, object_id, video_is_processing,
-    get_video, queue_video_retry, create_job, update_video, update_job, get_job_for_video)
+    get_video, get_events, queue_video_retry, create_job, update_video, update_job, get_job_for_video)
 from app.services.storage import safe_video_path, safe_processed_path
 from app.services.timestamps import event_video_seconds, format_video_timestamp
 
@@ -11,7 +13,7 @@ bp = Blueprint("history", __name__)
 
 
 def _format_upload_date(value):
-    """Render current and legacy MongoDB upload_date values safely."""
+    """Render UTC-written and legacy upload dates in India Standard Time."""
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, str):
@@ -23,7 +25,7 @@ def _format_upload_date(value):
         return "Unknown"
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    return parsed.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%d %b %Y, %I:%M %p IST")
 
 
 @bp.get("/history")
@@ -40,17 +42,42 @@ def history():
         video["original_name"] = video.get("original_filename")
         video["uploaded_at"] = _format_upload_date(video.get("upload_date"))
         video["status"] = video.get("processing_status")
+        video["status_label"] = {
+            "queued": "Pending", "waiting_for_mongodb": "Pending · Local fallback",
+            "processing": "Processing", "running": "Processing",
+            "complete": "Complete", "completed": "Complete",
+            "failed": "Failed", "interrupted": "Interrupted",
+        }.get(video["status"], "Pending" if not video["status"] else str(video["status"]).replace("_", " ").title())
         video["file_size"] = video.get("file_size", 0)
-        video["face_analysis"] = video.get("face_analysis") or {"status": "not_run", "face_observations": 0}
+        video["face_analysis"] = video.get("face_analysis") or {"status": "not_configured"}
         video["pose_analysis"] = video.get("pose_analysis") or {"status": "not_configured"}
         video["object_analysis"] = video.get("object_analysis") or {"status": "not_configured"}
-        video["fight_analysis"] = video.get("fight_analysis") or {"status": "not_configured", "candidate_event_count": 0}
+        video["fight_analysis"] = video.get("fight_analysis") or {"status": "not_configured"}
         video["suspected_fighting_count"] = video.get("suspected_fighting_count", 0)
         entry = video.get("latest_restricted_zone_entry")
         seconds = event_video_seconds(entry)
         video["latest_zone_entry_time"] = format_video_timestamp(seconds) if seconds is not None else None
         video["latest_zone_entry_name"] = ((entry or {}).get("zone_name") or
             ((entry or {}).get("details") or {}).get("zone_name"))
+        history_events = get_events(video["id"], limit=100)
+        for event in history_events:
+            event["history_time"] = format_video_timestamp(event_video_seconds(event))
+            event["history_end_time"] = format_video_timestamp(
+                event.get("end_timestamp_seconds", event.get("end_video_position_seconds")))
+            details = event.get("details") if isinstance(event.get("details"), dict) else {}
+            event["history_zone_name"] = (event.get("zone_name") or details.get("zone_name") or
+                                           details.get("zone_id"))
+            score = event.get("anomaly_score")
+            event["history_score_kind"] = "Anomaly score (uncalibrated)"
+            if score is None:
+                score = event.get("confidence")
+                event["history_score_kind"] = "Detector confidence"
+            try:
+                score = float(score) if score is not None else None
+                event["history_score_label"] = f"{score:.3f}" if score is not None and math.isfinite(score) else None
+            except (TypeError, ValueError, OverflowError):
+                event["history_score_label"] = None
+        video["history_events"] = history_events
     return render_template("history.html", videos=videos, q=q, status=status, page=page, total=total, per_page=25)
 
 

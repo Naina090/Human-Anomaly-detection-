@@ -1,16 +1,198 @@
 {% extends 'base.html' %}
 {% block title %}History | AnomaX AI{% endblock %}
-{% block meta_description %}Browse saved video analyses in AnomaX AI.{% endblock %}
-{% block content %}
-<div class="wrap page">
-  <div class="page-heading"><div><div class="eyebrow">RECORDS / 04</div><h1>Analysis history</h1><p>Search saved uploads and review face and anomaly analysis jobs.</p></div><a class="button primary" href="/upload">+ New analysis</a></div>
-  <form class="filters" role="search"><input name="q" value="{{ q }}" placeholder="Search filename..." aria-label="Search filename"><select name="status" aria-label="Filter processing status"><option value="">All statuses</option>{% for value,label in [('queued','Queued'),('processing','Processing'),('complete','Complete'),('failed','Failed'),('interrupted','Interrupted'),('waiting_for_mongodb','Waiting for MongoDB')] %}<option value="{{ value }}" {% if status==value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select><button class="button secondary">Filter</button></form>
-  <section class="panel">
-    {% if videos %}<div class="table-wrap"><table><thead><tr><th>Video</th><th>Uploaded</th><th>File size</th><th>Status</th><th>Face analysis</th><th>Pose analysis</th><th>Object analysis</th><th>Fighting analysis</th><th>Anomaly events / restricted-zone entries</th><th>Duration</th><th>Process time</th><th>Actions</th></tr></thead><tbody>
-      {% for v in videos %}<tr><td>{{ v.original_name }}</td><td>{{ v.uploaded_at[:16].replace('T',' ') }}</td><td>{% if v.file_size >= 1048576 %}{{ '%.2f'|format(v.file_size / 1048576) }} MB{% elif v.file_size %}{{ '%.1f'|format(v.file_size / 1024) }} KB{% else %}—{% endif %}</td><td><span class="badge {{ v.status }}">{{ v.status }}</span></td><td>{{ v.face_analysis.status|replace('_',' ')|title }}{% if v.face_analysis.status == 'complete' %}<small class="muted"> · {{ v.face_analysis.face_observations or 0 }} sampled observations</small>{% endif %}</td><td>{{ v.pose_analysis.status|replace('_',' ')|title }}{% if v.pose_analysis.model_name %}<small class="muted"> ? {{ v.pose_analysis.model_name }}</small>{% endif %}</td><td>{{ v.object_analysis.status|replace('_',' ')|title }}{% if v.object_analysis.model_name %}<small class="muted"> ? {{ v.object_analysis.model_name }}</small>{% endif %}</td><td>{{ v.fight_analysis.status|replace('_',' ')|title }}<small class="muted">{{ v.suspected_fighting_count or 0 }} candidates</small></td><td>{{ v.event_count }}<small class="muted">{{ v.restricted_zone_entry_count or 0 }} restricted-zone entries{% if v.latest_zone_entry_time %}<br>Latest confirmed entry: {{ v.latest_zone_entry_time }}{% if v.latest_zone_entry_name %} ? {{ v.latest_zone_entry_name }}{% endif %}{% endif %}</small></td><td>{{ '%.1f'|format(v.duration or 0) }}s</td><td>{{ '%.1f'|format(v.processing_duration or 0) }}s</td><td class="actions"><a href="{{ url_for('videos.results',video_id=v.id) }}">View</a><a href="{{ url_for('videos.download_media',video_id=v.id) }}">Download</a>{% if v.status in ['failed','interrupted'] %}<form action="{{ url_for('history.retry',video_id=v.id) }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button>Retry</button></form>{% endif %}<form action="{{ url_for('history.delete',video_id=v.id) }}" method="post" data-confirm="Delete this video, its local files, and its stored analysis results?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="link-danger">Delete</button></form></td></tr>{% endfor %}
-    </tbody></table></div>
-    {% if total > per_page %}<nav class="pagination" aria-label="History pages">{% if page > 1 %}<a href="{{ url_for('history.history',q=q,status=status,page=page-1) }}">Previous</a>{% endif %}<span>Page {{ page }} · {{ total }} records</span>{% if page * per_page < total %}<a href="{{ url_for('history.history',q=q,status=status,page=page+1) }}">Next</a>{% endif %}</nav>{% endif %}
-    {% else %}<div class="empty"><span class="empty-icon">◧</span><h3>No matching videos</h3><p>Your uploaded videos are stored in MongoDB and will appear here.</p><a href="/upload">Analyze a video →</a></div>{% endif %}
+{% block meta_description %}Browse saved AnomaX AI video analyses, detector results, and review events.{% endblock %}
+
+{% macro status_badge(status) %}
+  <span class="history-substatus {{ status or 'unknown' }}">{{ (status or 'not_configured')|replace('_',' ')|title }}</span>
+{% endmacro %}
+
+{% macro face_summary(v) %}
+  {% set face = v.face_analysis or {} %}
+  {{ status_badge(face.status) }}
+  <small>Frames with faces: {{ face.frames_with_faces if face.get('frames_with_faces') is not none else 'N/A' }}</small>
+  <small>Observations: {{ face.face_observations if face.get('face_observations') is not none else 'N/A' }}</small>
+{% endmacro %}
+
+{% macro pose_summary(v) %}
+  {% set pose = v.pose_analysis or {} %}
+  {{ status_badge(pose.status) }}
+  <small>Model: {{ pose.model_name or 'Not recorded' }}</small>
+  <small>Frames with poses: {{ pose.frames_with_people if pose.get('frames_with_people') is not none else 'N/A' }}</small>
+{% endmacro %}
+
+{% macro object_summary(v) %}
+  {% set objects = v.object_analysis or {} %}
+  {{ status_badge(objects.status) }}
+  <small>Observations: {{ objects.observations if objects.get('observations') is not none else 'N/A' }}</small>
+  <small>Classes: {% if objects.counts_by_class %}{{ objects.counts_by_class.keys()|list|sort|join(', ') }}{% else %}None recorded{% endif %}</small>
+  {% if objects.get('person_track_count_estimate') is not none %}<small>Approx. temporary person tracks: {{ objects.person_track_count_estimate }}</small>{% endif %}
+{% endmacro %}
+
+{% macro fighting_summary(v) %}
+  {% set fighting = v.fight_analysis or {} %}
+  {% set candidate_count = fighting.get('candidate_event_count') if fighting.get('candidate_event_count') is not none else v.suspected_fighting_count %}
+  <div class="history-main-summary">{{ status_badge(fighting.status) }}
+  <strong>Fighting: {% if candidate_count %}{{ candidate_count }} candidate{% if candidate_count != 1 %}s{% endif %}{% elif fighting.status == 'complete' %}None{% else %}N/A{% endif %}
+  </strong></div>
+  <small>{{ fighting.model_name or fighting.method or 'X3D-M' }} · review signal only</small>
+{% endmacro %}
+
+{% macro anomaly_summary(v) %}
+  <div class="history-main-summary"><strong>Anomalies: {% if v.event_count is not none %}{{ v.event_count }} event{% if v.event_count != 1 %}s{% endif %}{% else %}N/A{% endif %}</strong></div>
+{% endmacro %}
+
+{% macro zone_summary(v) %}
+  {% set zones_known = v.get('zones') is not none or v.get('zone_analysis') is not none %}
+  {% set zone_analysis = v.zone_analysis or {} %}
+  <div class="history-main-summary"><strong>Zone Entries:
+    {% if v.restricted_zone_entry_count %}{{ v.restricted_zone_entry_count }} entr{% if v.restricted_zone_entry_count == 1 %}y{% else %}ies{% endif %}
+    {% elif v.get('zones') is not none and not v.zones %}No zone
+    {% elif zones_known and zone_analysis.get('status') == 'not_configured' %}No zone
+    {% elif v.restricted_zone_entry_count is not none %}0 entries
+    {% else %}N/A{% endif %}
+  </strong></div>
+{% endmacro %}
+
+{% macro analysis_details(v) %}
+<div class="history-analysis-grid">
+  <section class="history-analysis-card"><h3>Video and Processing Details</h3>
+    <p>Original filename: <b>{{ v.original_name or 'Filename unavailable' }}</b></p>
+    <p>Uploaded (IST): <b>{{ v.uploaded_at }}</b></p>
+    <p>Current analysis status: <b>{{ v.status_label }}</b></p>
+    <p>File size: <b>{% if v.file_size %}{% if v.file_size >= 1048576 %}{{ '%.2f'|format(v.file_size / 1048576) }} MB{% else %}{{ '%.1f'|format(v.file_size / 1024) }} KB{% endif %}{% else %}N/A{% endif %}</b></p>
+    <p>Duration: <b>{% if v.get('duration') is not none %}{{ '%.2f'|format(v.duration) }} s{% else %}N/A{% endif %}</b></p>
+    <p>Process time: <b>{% if v.get('processing_duration') is not none %}{{ '%.2f'|format(v.processing_duration) }} s{% else %}N/A{% endif %}</b></p>
+  </section>
+  {% set face = v.face_analysis or {} %}
+  {% set pose = v.pose_analysis or {} %}
+  {% set objects = v.object_analysis or {} %}
+  {% set fighting = v.fight_analysis or {} %}
+  {% set occupancy = namespace(count=0) %}
+  {% for summary in v.event_type_summary or [] %}{% if summary.event_type == 'zone_presence_observed' %}{% set occupancy.count = occupancy.count + summary.count %}{% endif %}{% endfor %}
+  <section class="history-analysis-card"><h3>Face Analysis {{ status_badge(face.status) }}</h3>
+    <p>Sampled frames containing faces: <b>{{ face.frames_with_faces if face.get('frames_with_faces') is not none else 'N/A' }}</b></p>
+    <p>Total face observations: <b>{{ face.face_observations if face.get('face_observations') is not none else 'N/A' }}</b></p>
+    <small>Observations are frame-level counts, not unique individuals. No identity recognition is performed.</small>
+  </section>
+  <section class="history-analysis-card"><h3>Pose Analysis {{ status_badge(pose.status) }}</h3>
+    <p>Pose model: <b>{{ pose.model_name or 'Not recorded' }}{% if pose.model_version %} · {{ pose.model_version }}{% endif %}</b></p>
+    <p>Sampled frames with people/poses: <b>{{ pose.frames_with_people if pose.get('frames_with_people') is not none else 'N/A' }}</b></p>
+    {% if pose.error_message %}<small class="history-warning">{{ pose.error_message }}</small>{% endif %}
+  </section>
+  <section class="history-analysis-card"><h3>Object Analysis {{ status_badge(objects.status) }}</h3>
+    <p>YOLO model: <b>{{ objects.model_name or 'Not recorded' }}</b></p>
+    <p>Total sampled object observations: <b>{{ objects.observations if objects.get('observations') is not none else 'N/A' }}</b></p>
+    {% if objects.counts_by_class %}<ul class="history-class-counts">{% for label,count in objects.counts_by_class|dictsort %}<li><span>{{ label|title }}</span><b>{{ count }} observations</b></li>{% endfor %}</ul>{% else %}<p>Object classes: <b>None recorded</b></p>{% endif %}
+    {% if objects.get('person_track_count_estimate') is not none %}<p>Approximate temporary person track IDs: <b>{{ objects.person_track_count_estimate }}</b></p><small>Track IDs are temporary associations, not unique people or identities.</small>{% endif %}
+  </section>
+  <section class="history-analysis-card"><h3>Fighting Analysis {{ status_badge(fighting.status) }}</h3>
+    <p>Classifier: <b>{{ fighting.model_name or fighting.method or 'X3D-M temporal classifier' }}</b></p>
+    <p>Violence-related candidate intervals: <b>{% if fighting.get('candidate_event_count') is not none %}{{ fighting.candidate_event_count }}{% elif v.suspected_fighting_count %}{{ v.suspected_fighting_count }}{% elif fighting.status == 'complete' %}0{% else %}N/A{% endif %}</b></p>
+    <small>Any candidates are automated review signals requiring human review; they are not confirmed incidents.</small>
+  </section>
+  <section class="history-analysis-card history-analysis-wide"><h3>Anomaly Events and Restricted Zones</h3>
+    <p>Saved anomaly candidates: <b>{{ v.event_count if v.event_count is not none else 'N/A' }}</b></p>
+    <p>Confirmed restricted-zone entry events: <b>{{ v.restricted_zone_entry_count if v.restricted_zone_entry_count is not none else 'N/A' }}</b></p>
+    <p>Latest confirmed entry: <b>{{ v.latest_zone_entry_time or 'Time unavailable' }}{% if v.latest_zone_entry_name %} · {{ v.latest_zone_entry_name }}{% endif %}</b></p>
+    <p>Saved zones:
+      <b>{% if v.get('zones') is not none %}{% if v.zones %}{% for zone in v.zones %}{{ zone.name or zone.zone_id or 'Unnamed zone' }} ({{ 'enabled' if zone.enabled else 'disabled' }}){% if not loop.last %}, {% endif %}{% endfor %}{% else %}No zone configured{% endif %}{% else %}N/A{% endif %}</b>
+    </p>
+    <p>Initial zone occupancy observations (entry not observed): <b>{{ occupancy.count }}</b></p>
+    {% if v.event_type_summary %}<ul class="history-event-summary">{% for item in v.event_type_summary %}<li><span>{{ item.event_type|replace('_',' ')|title }} · {{ item.review_status|replace('_',' ')|title }}</span><b>{{ item.count }}</b></li>{% endfor %}</ul>{% else %}<small>No saved event records are available for this video.</small>{% endif %}
+    <small>Initial occupancy is not counted as an entry. Event counts and review states reflect persisted records only.</small>
+  </section>
+  <section class="history-analysis-card history-analysis-wide"><h3>Saved event timeline (up to 100 records)</h3>
+    {% if v.history_events %}<ol class="history-event-timeline">{% for event in v.history_events %}
+      <li><b>{{ event.history_time or 'Video time unavailable' }}</b> · {{ event.event_type|default('unknown')|replace('_',' ')|title }}
+        {% if event.history_end_time %}<span> to {{ event.history_end_time }}</span>{% endif %}
+        {% if event.label %}<span> — {{ event.label }}</span>{% endif %}
+        {% if event.history_zone_name %}<span> · Zone: {{ event.history_zone_name }}</span>{% endif %}
+        {% if event.track_id is not none %}<span> · Temporary track: {{ event.track_id }}</span>{% endif %}
+        {% if event.history_score_label %}<span> · {{ event.history_score_kind }}: {{ event.history_score_label }}</span>{% endif %}
+        <span> · Review: {{ (event.incident_status or 'not reviewed')|replace('_',' ')|title }}</span>
+      </li>
+    {% endfor %}</ol>{% else %}<small>No saved event details are available for this video.</small>{% endif %}
   </section>
 </div>
+{% endmacro %}
+
+{% macro actions(v, mobile=false) %}
+<div class="history-actions">
+  <a class="history-action" href="{{ url_for('videos.results',video_id=v.id) }}" aria-label="View results for {{ v.original_name or 'video' }}">View Results</a>
+  <a class="history-action" href="{{ url_for('videos.download_media',video_id=v.id) }}" aria-label="Download {{ v.original_name or 'video' }}">Download</a>
+  {% if v.status in ['failed','interrupted'] %}<form action="{{ url_for('history.retry',video_id=v.id) }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="history-action" type="submit">Retry</button></form>{% endif %}
+  <form action="{{ url_for('history.delete',video_id=v.id) }}" method="post" data-confirm="Delete this video, its local files, and its stored analysis results?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="history-action link-danger" type="submit">Delete</button></form>
+</div>
+{% endmacro %}
+
+{% block content %}
+<style>
+.history-page,.history-panel,.history-desktop,.history-mobile{min-width:0;max-width:100%}
+.history-panel .table-wrap{width:100%;min-width:0;max-width:100%;overflow-x:auto;overscroll-behavior-inline:contain;scrollbar-color:#31516c #0b1725}
+.history-table{table-layout:fixed;min-width:900px;width:100%;white-space:normal}
+.history-table th,.history-table td{vertical-align:top;overflow-wrap:anywhere}
+.history-table th:nth-child(1){width:30%}.history-table th:nth-child(2){width:20%}.history-table th:nth-child(3){width:13%}.history-table th:nth-child(4){width:15%}.history-table th:nth-child(5){width:22%}
+.history-filename span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:340px}
+.history-badge{white-space:normal;line-height:1.35}.history-badge.queued,.history-badge.processing,.history-badge.waiting_for_mongodb,.history-badge.interrupted{background:#392e1e;color:#f3c477}
+.history-substatus{display:inline-block;padding:3px 6px;border:1px solid #2d4259;border-radius:99px;color:#61cde7;font:600 9px 'DM Sans',sans-serif;text-transform:uppercase;line-height:1.3}
+.history-substatus.not_configured,.history-substatus.disabled{color:#aab8c8}.history-substatus.failed,.history-substatus.unavailable{color:#f49a9e;border-color:#68404a}.history-substatus.queued,.history-substatus.pending,.history-substatus.processing{color:#f3c477;border-color:#645239}
+.history-main-summary{display:flex;flex-wrap:wrap;gap:4px;align-items:center}.history-main-summary strong{font-size:11px;color:#eaf3fa}.history-table td>small{display:block;margin-top:5px;color:#aebdcd;font-size:10px;line-height:1.45}
+.history-actions{display:flex;flex-wrap:wrap;gap:5px;align-items:center;min-width:0}.history-actions form{margin:0}.history-action{display:inline-flex;align-items:center;justify-content:center;min-height:30px;padding:5px 8px;border:1px solid #2d4259;border-radius:7px;background:#122238;color:#b9eefa;font:600 10px 'DM Sans',sans-serif;cursor:pointer;white-space:nowrap}
+.history-action:hover{background:#1a3047;color:#fff}.history-actions .link-danger{color:#ee9295;background:transparent}
+.history-details-row>td{padding:15px;background:#0c1827}.history-details-button{min-width:105px}.history-analysis-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}.history-analysis-card{min-width:0;padding:14px;border:1px solid #21364d;border-radius:11px;background:#101d2e;white-space:normal}
+.history-analysis-card h3{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin:0 0 10px;font:700 13px Manrope,sans-serif}.history-analysis-card p{margin:6px 0;color:#aebdcd;font-size:11px;line-height:1.55}.history-analysis-card b{color:#eaf3fa}
+.history-analysis-card small{display:block;color:#8297ad;font-size:10px;line-height:1.55;margin-top:7px}.history-analysis-card .history-warning{color:#f1c175}.history-analysis-wide{grid-column:1/-1}
+.history-class-counts,.history-event-summary{list-style:none;padding:0;margin:8px 0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.history-class-counts li,.history-event-summary li{display:flex;justify-content:space-between;gap:10px;padding:7px 9px;border-radius:6px;background:#0b1725;color:#aebdcd;font-size:10px}.history-class-counts b,.history-event-summary b{white-space:nowrap}
+.history-event-timeline{max-height:340px;overflow:auto;margin:8px 0;padding-left:22px;color:#aebdcd;font-size:11px;line-height:1.7}.history-event-timeline li{padding:4px 0}.history-event-timeline b{color:#61cde7}.history-mobile{display:none}
+.history-card{min-width:0;margin-bottom:12px;padding:15px;border:1px solid #253a52;border-radius:13px;background:#0e1b2c}.history-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}.history-card-head h2{max-width:100%;margin:5px 0 0;overflow-wrap:anywhere;font:700 14px Manrope,sans-serif}
+.history-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin:14px 0}.history-facts div{min-width:0;padding:9px;border-radius:7px;background:#0a1624}.history-facts dt{color:#8397ad;font-size:9px;text-transform:uppercase;letter-spacing:.7px}.history-facts dd{margin:5px 0 0;color:#d6e1eb;font-size:11px;overflow-wrap:anywhere}
+.history-mobile-analysis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px 0}.history-mobile-analysis section{min-width:0;padding:10px;border:1px solid #21364d;border-radius:8px;background:#101d2e}.history-mobile-analysis h3{margin:0 0 6px;color:#dce8f3;font-size:11px}.history-mobile-analysis small{display:block;margin-top:4px;color:#aebdcd;font-size:10px;line-height:1.4}
+.history-mobile-details{margin-top:12px;padding:10px;border-top:1px solid #25364b}.history-mobile-details>summary{cursor:pointer;color:#61cde7;font-weight:700;font-size:11px}.history-filters label{display:grid;gap:5px}.history-filters input,.history-filters select{display:block}.history-page{overflow-x:clip}
+@media(max-width:820px){.history-desktop{display:none}.history-mobile{display:block}.history-analysis-grid{grid-template-columns:1fr}.history-analysis-wide{grid-column:auto}.history-filters{display:grid;grid-template-columns:1fr 1fr;align-items:end}.history-filters label:first-child{grid-column:1/-1}.history-filters button{grid-column:1/-1}.history-panel{padding:14px}}
+@media(max-width:480px){.history-filters,.history-mobile-analysis{grid-template-columns:1fr}.history-filters label:first-child,.history-filters button{grid-column:auto}.history-actions{gap:6px}.history-action{font-size:9px;padding:5px 7px}.history-class-counts,.history-event-summary{grid-template-columns:1fr}.history-analysis-card h3{font-size:12px}}
+</style>
+
+<div class="wrap page history-page">
+  <div class="page-heading"><div><div class="eyebrow">RECORDS / 04</div><h1>Analysis history</h1><p>Search saved uploads and review the analysis actually recorded for each video.</p></div><a class="button primary" href="/upload">+ New analysis</a></div>
+  <form class="filters history-filters" role="search" method="get" action="{{ url_for('history.history') }}">
+    <label>Video filename<input name="q" value="{{ q }}" placeholder="Search filename..." aria-label="Search filename"></label>
+    <label>Processing status<select name="status" aria-label="Filter processing status"><option value="">All statuses</option>{% for value,label in [('queued','Pending'),('processing','Processing'),('complete','Complete'),('failed','Failed'),('interrupted','Interrupted'),('waiting_for_mongodb','Pending · Local fallback')] %}<option value="{{ value }}" {% if status==value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <button class="button secondary" type="submit">Filter</button>
+  </form>
+  <section class="panel history-panel" aria-label="Saved video analyses">
+    {% if videos %}
+    <div class="history-desktop table-wrap" tabindex="0" role="region" aria-label="Scrollable video analysis history table"><table class="history-table"><thead><tr>
+      <th scope="col">Video</th><th scope="col">Uploaded (IST)</th><th scope="col">Status</th><th scope="col">More Details</th><th scope="col">Actions</th>
+    </tr></thead><tbody>
+      {% for v in videos %}
+      <tr class="history-row">
+        <td class="history-filename"><span title="{{ v.original_name or 'Filename unavailable' }}" aria-label="{{ v.original_name or 'Filename unavailable' }}">{{ v.original_name or 'Filename unavailable' }}</span></td>
+        <td>{{ v.uploaded_at }}</td>
+        <td><span class="badge history-badge {{ v.status or 'unknown' }}">{{ v.status_label }}</span></td>
+        <td><button class="history-action history-details-toggle history-details-button" type="button" aria-expanded="false" aria-controls="analysis-{{ v.id }}">More Details</button></td>
+        <td>{{ actions(v) }}</td>
+      </tr>
+      <tr class="history-details-row" id="analysis-{{ v.id }}" hidden><td colspan="5">{{ analysis_details(v) }}</td></tr>
+      {% endfor %}
+    </tbody></table></div>
+    <div class="history-mobile" aria-label="Video analysis records">
+      {% for v in videos %}<article class="history-card">
+        <div class="history-card-head"><div><span class="eyebrow">VIDEO</span><h2 title="{{ v.original_name or 'Filename unavailable' }}">{{ v.original_name or 'Filename unavailable' }}</h2></div><span class="badge history-badge {{ v.status or 'unknown' }}">{{ v.status_label }}</span></div>
+        <dl class="history-facts"><div><dt>Uploaded (IST)</dt><dd>{{ v.uploaded_at }}</dd></div><div><dt>Status</dt><dd>{{ v.status_label }}</dd></div></dl>
+        <div class="history-mobile-analysis" aria-label="Saved analysis summaries">
+          <section><h3>Face Analysis</h3>{{ face_summary(v) }}</section>
+          <section><h3>Pose Analysis</h3>{{ pose_summary(v) }}</section>
+          <section><h3>Object Analysis</h3>{{ object_summary(v) }}</section>
+          <section><h3>Fighting Analysis</h3>{{ fighting_summary(v) }}</section>
+          <section><h3>Anomaly Events</h3>{{ anomaly_summary(v) }}</section>
+          <section><h3>Restricted-Zone Entries</h3>{{ zone_summary(v) }}</section>
+        </div>
+        {{ actions(v, true) }}<details class="history-mobile-details"><summary>More Details</summary>{{ analysis_details(v) }}</details>
+      </article>{% endfor %}
+    </div>
+    {% if total > per_page %}<nav class="pagination" aria-label="History pages">{% if page > 1 %}<a href="{{ url_for('history.history',q=q,status=status,page=page-1) }}">Previous</a>{% endif %}<span>Page {{ page }} · {{ total }} records</span>{% if page * per_page < total %}<a href="{{ url_for('history.history',q=q,status=status,page=page+1) }}">Next</a>{% endif %}</nav>{% endif %}
+    {% else %}<div class="empty"><span class="empty-icon">◧</span><h3>No matching videos</h3><p>Saved uploads will appear here after the video record is successfully stored.</p><a href="/upload">Analyze a video →</a></div>{% endif %}
+  </section>
+</div>
+<script src="{{ url_for('static',filename='js/history.js') }}"></script>
 {% endblock %}

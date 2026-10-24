@@ -4,7 +4,7 @@ import os
 import sys
 import time
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import cv2
@@ -159,7 +159,11 @@ def test_empty_history_shows_real_empty_state(client):
     assert b"will appear here" in response.data
 
 
-def test_results_alert_status_is_read_only_and_renders_latest_state(client, app):
+def test_results_alert_status_is_read_only_and_renders_latest_state(client, app, monkeypatch):
+    import app.services.notifier as notifier
+    refresh_calls = []
+    monkeypatch.setattr(notifier, "schedule_pending_alerts",
+                        lambda *_args: refresh_calls.append("scheduled"))
     now = datetime.now(timezone.utc)
     video_id = app.extensions["mongo_db"].videos.insert_one({
         "original_filename": "alert-status.mp4", "processing_status": "complete",
@@ -174,9 +178,60 @@ def test_results_alert_status_is_read_only_and_renders_latest_state(client, app)
     assert response.json["notifications"][0]["status"] == "sent"
     page = client.get(f"/results/{video_id}")
     assert page.status_code == 200
-    assert b"Consolidated video alert" in page.data
+    assert b"Delivery status:" in page.data
     assert b"Sent" in page.data
+    assert b"alert-live-status" in page.data
+    assert b"alert-live-summary" in page.data
+    assert page.data.count(b"class=\"method-card alert-delivery alert-live-status\"") == 1
+    assert refresh_calls == []
     assert app.extensions["mongo_db"].videos.find_one({"_id": video_id})["email_alert_notifications"][0]["status"] == "sent"
+
+
+def test_alert_status_maps_legacy_disabled_to_skipped(client, app):
+    video_id = app.extensions["mongo_db"].videos.insert_one({
+        "original_filename": "skipped-alert.mp4", "processing_status": "complete",
+        "email_alert_notifications": [{"notification_id": "disabled-legacy", "status": "disabled",
+                                        "failure_reason": "Email alerts disabled", "episodes": []}],
+    }).inserted_id
+    response = client.get(f"/api/videos/{video_id}/alerts")
+    assert response.status_code == 200
+    assert response.json["delivery_status"] == "skipped"
+    assert response.json["notifications"][0]["status"] == "skipped"
+
+
+def test_alert_status_poll_moves_from_sending_to_sent_and_stops_at_terminal(client, app):
+    video_id = app.extensions["mongo_db"].videos.insert_one({
+        "original_filename": "live-alert.mp4", "processing_status": "complete",
+        "email_alert_notifications": [{"notification_id": "live-digest", "status": "sending",
+                                        "last_attempt_at": datetime.now(timezone.utc),
+                                        "delivery_protocol_version": 2,
+                                        "episodes": [{"event_type": "potential_fall", "timestamp_seconds": 2.0}] }],
+    }).inserted_id
+    url = f"/api/videos/{video_id}/alerts"
+    sending = client.get(url)
+    assert sending.status_code == 200 and sending.json["delivery_status"] == "sending"
+    app.extensions["mongo_db"].videos.update_one(
+        {"_id": video_id}, {"$set": {"email_alert_notifications.0.status": "sent"}})
+    sent = client.get(url)
+    assert sent.status_code == 200 and sent.json["delivery_status"] == "sent"
+    script = client.get("/static/js/results.js")
+    assert script.status_code == 200
+    assert b"terminal.has(state)" in script.data
+    assert b"cache:'no-store'" in script.data
+
+
+def test_alert_status_database_failure_returns_safe_retryable_response(client, app, monkeypatch):
+    import app.routes.videos as video_routes
+    from app.db import DatabaseUnavailable
+    video_id = app.extensions["mongo_db"].videos.insert_one({
+        "original_filename": "unavailable-alert.mp4", "processing_status": "complete",
+    }).inserted_id
+    monkeypatch.setattr(video_routes, "get_video",
+                        lambda _identifier: (_ for _ in ()).throw(DatabaseUnavailable("database temporarily unavailable")))
+    response = client.get(f"/api/videos/{video_id}/alerts")
+    assert response.status_code == 503
+    assert response.json["delivery_status"] == "unavailable"
+    assert "database temporarily unavailable" in response.json["error"]
 
 
 def test_alert_status_resumes_only_previously_reserved_stale_pre_smtp_delivery(client, app, monkeypatch):
@@ -235,6 +290,76 @@ def test_history_page_handles_legacy_video_without_upload_date(client, app):
     assert response.status_code == 200
     assert b"legacy-history-video.avi" in response.data
     assert b"Unknown" in response.data
+
+
+def test_history_table_shows_ist_and_expandable_saved_ai_details(client, app):
+    from app.routes.history import _format_upload_date
+    assert _format_upload_date(datetime(2026, 10, 24, 20, 34, tzinfo=timezone.utc)) == "25 Oct 2026, 02:04 AM IST"
+    with app.app_context():
+        video_id = create_video({**video_doc("very-long-surveillance-video-filename.mp4", "complete"),
+            "upload_date": datetime(2026, 10, 24, 20, 34, tzinfo=timezone.utc),
+            "file_size": 2_400_000, "duration": 10.0, "processing_duration": 28.39,
+            "face_analysis": {"status": "complete", "frames_with_faces": 4, "face_observations": 7},
+            "pose_analysis": {"status": "complete", "model_name": "yolo26n-pose.pt",
+                              "frames_with_people": 6},
+            "object_analysis": {"status": "complete", "model_name": "yolo26n.pt",
+                                "observations": 12, "counts_by_class": {"person": 10, "car": 2},
+                                "person_track_count_estimate": 3},
+            "fight_analysis": {"status": "complete", "model_name": "X3D-M", "candidate_event_count": 1}})
+        db = app.extensions["mongo_db"]
+        db.detection_events.insert_many([
+            {"video_id": video_id, "event_type": "potential_fall", "incident_status": "reviewing",
+             "timestamp_seconds": 3.0},
+            {"video_id": video_id, "event_type": "RESTRICTED_ZONE_ENTRY", "incident_status": "new",
+             "timestamp_seconds": 5.0, "track_id": 9, "details": {"zone_name": "North Gate"}},
+            {"video_id": video_id, "event_type": "zone_presence_observed", "incident_status": "not reviewed",
+             "timestamp_seconds": 1.0},
+            {"video_id": video_id, "event_type": "object_detection", "label": "person"},
+        ])
+    response = client.get("/history")
+    assert response.status_code == 200
+    page = response.get_data(as_text=True)
+    expected_columns = ["Video", "Uploaded (IST)", "Status", "More Details", "Actions"]
+    header = page[page.index("<thead>"):page.index("</thead>") + len("</thead>")]
+    assert header.count('<th scope="col">') == 5
+    assert [header.index(f">{label}</th>") for label in expected_columns] == sorted(
+        header.index(f">{label}</th>") for label in expected_columns)
+    assert "25 Oct 2026, 02:04 AM IST" in page
+    assert "2.29 MB" in page and "28.39 s" in page and "File size:" in page
+    assert "Face Analysis" in page and "7" in page and "not unique individuals" in page
+    assert "yolo26n-pose.pt" in page and "yolo26n.pt" in page
+    assert "12" in page and "3" in page and "requiring human review" in page
+    assert "Fighting: 1 candidate" in page and "Anomalies: 1 event" in page
+    assert "Zone Entries:" in page and "1 entry" in page
+    assert "Confirmed restricted-zone entry events" in page
+    assert "Initial zone occupancy observations (entry not observed)" in page
+    assert "Reviewing" in page and "Restricted Zone Entry" in page
+    assert "00:05.00" in page and "Temporary track: 9" in page and "Zone: North Gate" in page
+    assert "Anomalies:" in page and "Zone Entries:" in page
+    assert "history-details-toggle" in page and "history-mobile-details" in page
+    assert "history-mobile-analysis" in page and "Anomaly Events" in page and "Restricted-Zone Entries" in page
+    assert "history-details-button" in page and "More Details" in page
+    assert "Saved zones:" in page and "Temporary track: 9" in page
+    assert "@media(max-width:820px)" in page and "history-mobile" in page
+    assert "history-page{overflow-x:clip}" in page and "min-width:900px" in page
+    assert 'colspan="5"' in page
+    assert f"/results/{video_id}" in page and f"/media/{video_id}/download" in page
+    assert f"/history/{video_id}/delete" in page and "aria-expanded=\"false\"" in page
+    history_script = client.get("/static/js/history.js").get_data(as_text=True)
+    assert "closeOtherDetails(row)" in history_script and "closeOtherDetails(details)" in history_script
+
+
+def test_history_fallback_statuses_and_legacy_ai_fields_are_truthful(client, app):
+    from app.services.local_fallback import save_pending_upload
+    with app.app_context():
+        video_id, _job_id = save_pending_upload({"original_filename": "local-history.avi",
+            "stored_filename": "local-history-internal.avi", "file_path": "local-history-internal.avi",
+            "file_size": 2048, "duration": 2.5}, "test fallback")
+    page = client.get("/history").get_data(as_text=True)
+    assert "local-history.avi" in page and "Pending" in page
+    assert "Not Configured" in page
+    assert "Total face observations:" in page
+    assert "0.00 seconds" not in page
 
 
 def test_dashboard_shows_database_and_detector_readiness_without_fake_counts(client):
@@ -522,6 +647,34 @@ def test_object_detector_normalizes_supported_classes_and_temporary_tracks(tmp_p
     assert detector.model.calls[0]["classes"] == [0, 1, 2, 24]
     annotated = detector.annotate(frame, observations)
     assert np.any(annotated != frame) and np.all(frame == 0)
+    captions = []
+    monkeypatch.setattr(object_module.cv2, "putText",
+                        lambda image, text, *args, **kwargs: (captions.append(text), image)[1])
+    detector.annotate(frame, observations)
+    assert "person 0.91 ID 12" in captions
+    assert "car 0.82 ID 4" in captions
+    later_observations = detector.detect(frame, 1.75, 35)
+    assert later_observations[0]["track_id"] == 12
+    assert all(call["persist"] is True for call in detector.model.calls)
+
+
+def test_object_detector_returns_empty_for_frames_without_supported_objects(tmp_path, monkeypatch):
+    import app.services.object_detector as object_module
+    model_path = tmp_path / "local-coco.pt"
+    model_path.write_bytes(b"test model marker")
+    boxes = types.SimpleNamespace(xyxy=np.empty((0, 4)), cls=np.empty((0,)),
+                                  conf=np.empty((0,)), id=None)
+    result = types.SimpleNamespace(boxes=boxes, names={0: "person"})
+
+    class FakeYOLO:
+        names = {0: "person"}
+        def __init__(self, _path): pass
+        def track(self, _frame, **_kwargs): return [result]
+
+    monkeypatch.setattr(object_module.importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
+    detector = YoloObjectTracker(str(model_path))
+    assert detector.detect(np.zeros((32, 32, 3), dtype=np.uint8), 0, 0) == []
 
 
 def test_object_detector_reports_missing_configuration_without_downloading(tmp_path, monkeypatch):
@@ -536,6 +689,61 @@ def test_object_detector_reports_missing_configuration_without_downloading(tmp_p
     assert object_detector_status(str(model_path))["status"] == "unavailable"
     with pytest.raises(ObjectDetectorUnavailable, match="requirements-ai"):
         YoloObjectTracker(str(model_path))
+
+
+def test_object_model_relative_path_is_resolved_from_project_root_not_cwd(tmp_path, monkeypatch):
+    from app.services.object_detector import resolve_model_path
+    project_relative = resolve_model_path("models/not-installed.pt")
+    monkeypatch.chdir(tmp_path)
+    assert resolve_model_path("models/not-installed.pt") == project_relative
+    status = object_detector_status("models/not-installed.pt")
+    assert status["configured"] is True
+    assert status["status"] == "unavailable"
+    assert "not found" in status["message"]
+
+
+def test_results_group_object_observations_without_counting_unique_people(client, app):
+    from app.routes.videos import group_object_observations
+    observations = [
+        {"event_type": "object_detection", "label": "person", "track_id": 7,
+         "timestamp_seconds": 1.0, "confidence": .8, "frame_number": 30,
+         "details": {"bbox_xyxy": [1, 2, 30, 50]}},
+        {"event_type": "object_detection", "label": "person", "track_id": 7,
+         "timestamp_seconds": 3.0, "confidence": .9, "frame_number": 90,
+         "details": {"bbox_xyxy": [2, 3, 31, 51]}},
+        {"event_type": "object_detection", "label": "car", "track_id": 9,
+         "timestamp_seconds": 2.0, "confidence": .7, "frame_number": 60,
+         "details": {"bbox_xyxy": [4, 5, 40, 60]}},
+        {"event_type": "object_detection", "label": "person", "track_id": None,
+         "timestamp_seconds": 4.0, "details": {"bbox_xyxy": [0, 0, 10, 10]}},
+        {"event_type": "object_detection", "label": "person", "track_id": None,
+         "timestamp_seconds": 5.0, "details": {"bbox_xyxy": [0, 0, 10, 10]}},
+        {"event_type": "potential_fall", "timestamp_seconds": 6.0},
+    ]
+    grouped = group_object_observations(observations)
+    person_track = next(item for item in grouped if item["track_id"] == 7)
+    assert person_track["object_class"] == "person"
+    assert person_track["first_seen_seconds"] == 1.0
+    assert person_track["last_seen_seconds"] == 3.0
+    assert person_track["observation_count"] == 2
+    assert len([item for item in grouped if item["track_id"] is None]) == 2
+
+    with app.app_context():
+        video_id = create_video({**video_doc("object-summary.mp4", status="complete"),
+                                 "object_analysis": {"status": "complete", "observations": 5,
+                                                     "frames_sampled": 3, "counts_by_class": {"person": 4, "car": 1},
+                                                     "person_track_count_estimate": 1}})
+        db = app.extensions["mongo_client"][app.config["MONGO_DB_NAME"]]
+        for item in observations[:5]:
+            db.detection_events.insert_one({**item, "video_id": video_id})
+    response = client.get(f"/results/{video_id}")
+    assert response.status_code == 200
+    page = response.get_data(as_text=True)
+    assert "First observed" in page and "Last observed" in page
+    assert "Grouped summaries below count sampled observations" in page
+    assert "Full object-detection evidence (5 sampled observations)" in page
+    assert 'class="timeline-event object-observation"' in page
+    assert "No anomaly or restricted-zone events were recorded" in page
 
 
 def test_pose_model_alias_does_not_trigger_automatic_download(monkeypatch):
@@ -1127,6 +1335,138 @@ def test_upload_saves_processing_result_and_database_error_cleanup(client, app, 
     app.extensions["processing_executor"].shutdown(wait=True, cancel_futures=True)
     assert before.issubset(set(os.listdir(app.config["UPLOAD_DIR"])))
     assert len(set(os.listdir(app.config["UPLOAD_DIR"])) - before) == 1
+
+
+def test_upload_request_id_prevents_duplicate_jobs_but_allows_intentional_repeat_uploads(
+        client, app, tmp_path):
+    payload = make_video(tmp_path / "repeatable-name.avi")
+    token = "a" * 32
+    first = client.post("/upload", data={"csrf_token": csrf(client),
+        "upload_request_id": token,
+        "video": (io.BytesIO(payload), "same-name.avi")}, content_type="multipart/form-data")
+    duplicate = client.post("/upload", data={"csrf_token": csrf(client),
+        "upload_request_id": token,
+        "video": (io.BytesIO(payload), "same-name.avi")}, content_type="multipart/form-data")
+    assert first.status_code == duplicate.status_code == 302
+    assert first.headers["Location"] == duplicate.headers["Location"]
+    video_id = first.headers["Location"].rsplit("/", 1)[-1]
+    wait_for_status(app, video_id)
+    db = app.extensions["mongo_db"]
+    assert db.videos.count_documents({"upload_request_id": token}) == 1
+    assert db.processing_jobs.count_documents({"video_id": ObjectId(video_id)}) == 1
+
+    # A fresh form token represents a deliberate new analysis, even when the
+    # user selects the same local filename and bytes again.
+    repeated = client.post("/upload", data={"csrf_token": csrf(client),
+        "upload_request_id": "b" * 32,
+        "video": (io.BytesIO(payload), "same-name.avi")}, content_type="multipart/form-data")
+    assert repeated.status_code == 302
+    second_id = repeated.headers["Location"].rsplit("/", 1)[-1]
+    assert second_id != video_id
+    wait_for_status(app, second_id)
+    assert db.videos.count_documents({"original_filename": "same-name.avi"}) == 2
+    assert db.processing_jobs.count_documents({"video_id": {"$in": [ObjectId(video_id), ObjectId(second_id)]}}) == 2
+
+
+def test_new_upload_is_immediately_visible_and_updates_same_history_record(
+        client, app, tmp_path, monkeypatch):
+    db = app.extensions["mongo_db"]
+    with app.app_context():
+        older_id = create_video({**video_doc("older-failed.avi", "failed"),
+            "upload_date": datetime.now(timezone.utc) - timedelta(days=1)})
+    queued_calls = []
+    monkeypatch.setattr(app.extensions["processing_executor"], "submit",
+                        lambda *args, **kwargs: queued_calls.append((args, kwargs)))
+    payload = make_video(tmp_path / "newest-upload.avi")
+    upload_page = client.get("/upload").get_data(as_text=True)
+    request_key = upload_page.split('name="upload_request_id" value="', 1)[1].split('"', 1)[0]
+    assert request_key
+    response = client.post("/upload", data={"csrf_token": csrf(client),
+        "upload_request_id": request_key,
+        "video": (io.BytesIO(payload), "newest-upload.avi")}, content_type="multipart/form-data")
+    assert response.status_code == 302 and len(queued_calls) == 1
+    video_id = response.headers["Location"].rsplit("/", 1)[-1]
+    video = db.videos.find_one({"_id": ObjectId(video_id)})
+    job = db.processing_jobs.find_one({"video_id": ObjectId(video_id)})
+    assert video and video["processing_status"] == "queued"
+    assert job and job["status"] == "queued"
+
+    history = client.get("/history")
+    assert history.status_code == 200
+    page = history.get_data(as_text=True)
+    table_body = page[page.index("<tbody>"):page.index("</tbody>")]
+    assert table_body.index("newest-upload.avi") < table_body.index("older-failed.avi")
+    assert client.get(f"/history?status=queued").data.find(b"newest-upload.avi") >= 0
+    assert client.get(f"/history?status=failed").data.find(b"older-failed.avi") >= 0
+
+    with app.app_context():
+        for status, label in (("processing", "Processing"), ("complete", "Complete")):
+            assert update_video(video_id, {"processing_status": status})
+            refreshed = client.get("/history").data
+            assert b"newest-upload.avi" in refreshed and label.encode() in refreshed
+            assert db.videos.count_documents({"_id": ObjectId(video_id)}) == 1
+            assert db.processing_jobs.count_documents({"video_id": ObjectId(video_id)}) == 1
+
+
+def test_new_upload_form_gets_fresh_key_and_file_change_rotates_existing_key(client):
+    first = client.get("/upload").get_data(as_text=True)
+    second = client.get("/upload").get_data(as_text=True)
+    first_key = first.split('name="upload_request_id" value="', 1)[1].split('"', 1)[0]
+    second_key = second.split('name="upload_request_id" value="', 1)[1].split('"', 1)[0]
+    assert first_key != second_key
+    script = client.get("/static/js/main.js").get_data(as_text=True)
+    assert "if(hasSelectedFile&&uploadRequestId)" in script
+    assert "uploadRequestId.value=window.crypto?.randomUUID" in script
+
+
+def test_local_fallback_upload_is_visible_before_worker_finishes(client, app, tmp_path, monkeypatch):
+    from app.db import DatabaseUnavailable
+    import app.routes.videos as video_routes
+    monkeypatch.setattr(video_routes, "create_video",
+                        lambda _document: (_ for _ in ()).throw(DatabaseUnavailable("offline")))
+    monkeypatch.setattr(app.extensions["processing_executor"], "submit", lambda *args, **kwargs: None)
+    payload = make_video(tmp_path / "local-pending.avi")
+    response = client.post("/upload", data={"csrf_token": csrf(client),
+        "upload_request_id": "f" * 32,
+        "video": (io.BytesIO(payload), "local-pending.avi")}, content_type="multipart/form-data")
+    assert response.status_code == 302
+    video_id = response.headers["Location"].rsplit("/", 1)[-1]
+    page = client.get("/history").get_data(as_text=True)
+    assert "local-pending.avi" in page and "Pending" in page
+    from app.services.local_fallback import get_pending_video
+    with app.app_context():
+        local = get_pending_video(video_id)
+    assert local and local["processing_status"] == "queued"
+    assert (local.get("local_job") or {}).get("status") == "queued"
+
+
+def test_history_merges_mongodb_and_local_rows_by_actual_utc_upload_time(app):
+    from app.services.local_fallback import save_pending_upload, update_pending_video
+    with app.app_context():
+        current = datetime.now(timezone.utc)
+        local_id, _job = save_pending_upload({"original_filename": "local-newest.avi",
+            "stored_filename": "local-newest-internal.avi", "file_path": "local-newest-internal.avi"}, "offline")
+        update_pending_video(local_id, {"upload_date": current + timedelta(minutes=1)})
+        mongo_id = create_video({**video_doc("mongo-older.avi", "processing"), "upload_date": current})
+        videos, total = list_videos()
+        assert total == 2
+        assert str(videos[0]["_id"]) == str(local_id)
+        assert videos[1]["_id"] == mongo_id
+
+
+def test_local_fallback_upload_request_id_is_idempotent(client, app):
+    from app.services.local_fallback import save_pending_upload, list_pending_videos
+    document = {"upload_request_id": "c" * 32, "original_filename": "offline.avi",
+                "stored_filename": "first-copy.avi", "file_path": "first-copy.avi"}
+    with app.app_context():
+        video_id, job_id = save_pending_upload(document, "offline")
+        duplicate_id, duplicate_job_id = save_pending_upload(
+            {**document, "stored_filename": "duplicate-copy.avi", "file_path": "duplicate-copy.avi"}, "offline")
+        assert duplicate_id == video_id and duplicate_job_id == job_id
+        matching, _total = list_pending_videos(search="offline.avi", per_page=100)
+        matching = [row for row in matching if row.get("upload_request_id") == "c" * 32]
+        assert len(matching) == 1
+        assert matching[0]["stored_filename"] == "first-copy.avi"
 
 
 def test_invalid_video_is_rejected_before_database_or_job_creation(client, app, tmp_path):
@@ -1721,7 +2061,7 @@ def test_legacy_zone_time_renders_from_stored_numeric_timestamp(client, app):
     assert response.status_code == 200
     assert b"00:02.40" in response.data
     history = client.get("/history")
-    assert b"Latest confirmed entry: 00:02.40" in history.data
+    assert b"Latest confirmed entry:" in history.data and b"00:02.40" in history.data
     incidents = client.get("/incidents")
     assert b"00:02.40" in incidents.data
 
@@ -1809,7 +2149,7 @@ def test_restricted_zone_entry_persists_in_local_fallback_and_is_reviewable(app,
         assert videos[0]["restricted_zone_entry_count"] == 1
     assert b"RESTRICTED_ZONE_ENTRY" in client.get(f"/results/{video_id}").data
     history_page = client.get("/history").data
-    assert b"local-zone.mp4" in history_page and b"1 restricted-zone entries" in history_page
+    assert b"local-zone.mp4" in history_page and b"Zone Entries:" in history_page and b"1 entr" in history_page
     assert b"local-zone.mp4" in client.get("/incidents?status=reviewing").data
     assert b"RESTRICTED_ZONE_ENTRY" in client.get("/dashboard").data
 

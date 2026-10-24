@@ -104,6 +104,8 @@ def init_database(app):
         db.videos.create_index("upload_date", name="videos_upload_date")
         db.videos.create_index("processing_status", name="videos_status")
         db.videos.create_index([("original_filename", 1), ("upload_date", -1)], name="videos_filename_date")
+        db.videos.create_index("upload_request_id", unique=True, sparse=True,
+                               name="videos_upload_request_unique")
         db.videos.create_index("email_alert_notifications.status", name="videos_email_alert_status")
         db.detection_events.create_index("video_id", name="events_video_id")
         db.detection_events.create_index("created_at", name="events_created_at")
