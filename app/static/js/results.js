@@ -1,5 +1,6 @@
 const root=document.getElementById('analysis-result');
 document.querySelectorAll('.seek-time').forEach(button=>button.addEventListener('click',()=>{const video=document.getElementById('source-video');const seconds=Number(button.dataset.seconds);if(!video||!Number.isFinite(seconds)||seconds<0)return;video.currentTime=seconds;video.play()}));
+(()=>{const video=document.getElementById('source-video'),raw=new URLSearchParams(window.location.search).get('t'),seconds=raw===null?NaN:Number(raw);if(!video||!Number.isFinite(seconds)||seconds<0)return;const seek=()=>{if(Number.isFinite(video.duration)&&seconds<=video.duration)video.currentTime=seconds};if(video.readyState>=1)seek();else video.addEventListener('loadedmetadata',seek,{once:true})})();
 document.querySelectorAll('.result-player').forEach(player=>{
   const video=player.querySelector('video'),feedback=player.querySelector('.player-feedback'),retry=player.querySelector('.player-retry');
   if(!video||!feedback)return;

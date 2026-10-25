@@ -18,7 +18,7 @@ from app import create_app
 from app.db import DatabaseUnavailable, _friendly_connection_error, get_database
 from app.services.repository import (
     create_video, dashboard_stats, delete_video, get_video, list_videos,
-    object_id, report_data, update_video, create_job, claim_job, update_incident,
+    object_id, report_data, report_data_with_source, update_video, create_job, claim_job, update_incident,
 )
 from app.services.fall_detector import YoloPoseFallDetector
 from app.services.storage import safe_video_path, safe_processed_path
@@ -2223,6 +2223,185 @@ def test_pdf_report_empty_record_has_clear_zero_event_message(client, app):
     response = client.get(f"/results/{video_id}/report.pdf")
     assert response.status_code == 200
     assert b"No event records were saved" in response.data
+
+
+def test_reports_tabs_filters_and_real_overview_metrics(client, app):
+    with app.app_context():
+        first = create_video({**video_doc("analytics-alpha.mp4", "complete"),
+                              "upload_date": datetime(2026, 1, 2, 1, 0, tzinfo=timezone.utc),
+                              "duration": 12.5, "processing_duration": 3.2,
+                              "pose_analysis": {"status": "complete", "model_name": "pose-fixture"},
+                              "analysis_summary": "Saved evidence summary."})
+        second = create_video({**video_doc("analytics-beta.mp4", "failed"),
+                               "upload_date": datetime(2026, 1, 3, 1, 0, tzinfo=timezone.utc)})
+        create_video({**video_doc("legacy-iso-date.mp4", "queued"),
+                      "upload_date": "2026-01-02T01:00:00Z"})
+        db = app.extensions["mongo_db"]
+        db.detection_events.insert_many([
+            {"video_id": first, "event_type": "potential_fall", "timestamp_seconds": 2.0,
+             "start_timestamp_seconds": 2.0, "end_timestamp_seconds": 3.0,
+             "anomaly_score": .61, "detection_method": "pose heuristic", "incident_status": "new"},
+            {"video_id": first, "event_type": "object_detection", "timestamp_seconds": 2.5,
+             "label": "person", "confidence": .91, "detection_method": "YOLO", "track_id": 4},
+            {"video_id": second, "event_type": "RESTRICTED_ZONE_ENTRY", "timestamp_seconds": 4.0,
+             "zone_name": "Door", "track_id": 2, "incident_status": "reviewing"},
+        ])
+    page = client.get("/reports")
+    assert page.status_code == 200
+    html = page.get_data(as_text=True)
+    for tab in ("Overview", "Video Reports", "Event Timeline", "Technical Evidence", "Export &amp; Print"):
+        assert tab in html
+    assert "VIDEOS IN RANGE" in html and "SAVED DETECTOR OBSERVATIONS" in html
+    assert "Candidate episodes by category" in html and "Review queue" in html
+    assert "Data source: MongoDB" in html
+    assert "<span>VIDEOS IN RANGE</span><strong>3</strong>" in html
+    assert "<span>COMPLETED RUNS</span><strong>1</strong>" in html
+    assert "<span>ANOMALY REVIEW EPISODES</span><strong>2</strong>" in html
+    assert "<span>SAVED DETECTOR OBSERVATIONS</span><strong>3</strong>" in html
+    assert "<span>FAILED RUNS</span><strong>1</strong>" in html
+    assert "<span>OTHER RUN STATES</span><strong>1</strong>" in html
+    video_date_page = client.get("/reports?tab=videos")
+    assert b"02 Jan 2026, 06:30 AM IST" in video_date_page.data
+    ist_day = client.get("/reports?tab=videos&start=2026-01-02&end=2026-01-02")
+    assert ist_day.status_code == 200
+    ist_table = ist_day.get_data(as_text=True).split('<table class="report-table">', 1)[1].split("</table>", 1)[0]
+    assert "analytics-alpha.mp4" in ist_table and "legacy-iso-date.mp4" in ist_table
+    assert "analytics-beta.mp4" not in ist_table
+    videos_tab = client.get("/reports?tab=videos&video_q=alpha")
+    video_table = videos_tab.get_data(as_text=True).split('<table class="report-table">', 1)[1].split("</table>", 1)[0]
+    assert "analytics-alpha.mp4" in video_table and "analytics-beta.mp4" not in video_table
+    clear_link = client.get("/reports?tab=videos&video_q=alpha&start=2026-01-01").get_data(as_text=True)
+    assert 'href="/reports?tab=videos&amp;video_q=alpha"' in clear_link
+    assert b"View Report" in videos_tab.data and b"video-report-" in videos_tab.data
+    assert b"Saved evidence summary." in videos_tab.data
+    timeline = client.get("/reports?tab=timeline&category=potential_fall")
+    assert b"Potential Fall" in timeline.data and b"00:02.00" in timeline.data
+    assert b"Save review" in timeline.data
+    evidence = client.get("/reports?tab=evidence&category=object_detection")
+    assert b"Object Detection" in evidence.data and b"0.910" in evidence.data
+    assert client.get("/reports?tab=invalid").status_code == 400
+    assert client.get("/reports?start=2026-02-02&end=2026-01-01").status_code == 400
+
+
+def test_reports_group_episodes_per_video_and_review_updates_persist(client, app):
+    with app.app_context():
+        one = create_video(video_doc("same-name.mp4", "complete"))
+        two = create_video(video_doc("same-name.mp4", "complete"))
+        db = app.extensions["mongo_db"]
+        a = db.detection_events.insert_one({"video_id": one, "event_type": "potential_fall",
+            "timestamp_seconds": 4, "start_timestamp_seconds": 4, "end_timestamp_seconds": 6,
+            "track_id": 7, "anomaly_score": .55, "incident_status": "new"}).inserted_id
+        db.detection_events.insert_one({"video_id": two, "event_type": "potential_fall",
+            "timestamp_seconds": 4.5, "start_timestamp_seconds": 4.5, "end_timestamp_seconds": 6.5,
+            "track_id": 7, "anomaly_score": .6, "incident_status": "new"})
+    response = client.get("/reports?tab=timeline")
+    assert response.status_code == 200
+    assert response.get_data(as_text=True).count("same-name.mp4") >= 2
+    # Identical event times and track IDs across uploads must remain two episodes.
+    assert b"ANOMALY REVIEW EPISODES" in client.get("/reports").data
+    token = csrf(client)
+    review = client.post(f"/incidents/{a}/review", data={"csrf_token": token,
+        "status": "reviewing", "review_notes": "Inspect the stored pose transition.",
+        "next": "/reports?tab=timeline"})
+    assert review.status_code == 302
+    timeline = client.get("/reports?tab=timeline&review=reviewing")
+    assert b"Inspect the stored pose transition." in timeline.data
+    assert b"Reviewing" in timeline.data
+
+
+def test_reports_csv_protects_formula_text_and_supports_detail_option(client, app):
+    with app.app_context():
+        video_id = create_video(video_doc("=HYPERLINK(\"x\").mp4", "complete"))
+        app.extensions["mongo_db"].detection_events.insert_one({
+            "video_id": video_id, "event_type": "potential_fall", "label": "=IMPORTXML(\"x\")",
+            "timestamp_seconds": 1, "review_notes": "+cmd", "details": {"evidence": "@formula"}})
+    summary = client.get("/reports.csv")
+    detailed = client.get("/reports.csv?include_details=1")
+    assert summary.status_code == detailed.status_code == 200
+    assert b"'=HYPERLINK" in summary.data and b"'=IMPORTXML" in summary.data
+    assert b"'+cmd" in summary.data
+    assert b"@formula" not in summary.data
+    assert b"@formula" in detailed.data
+
+
+def test_reports_use_one_authoritative_store_and_fallback_when_atlas_unavailable(client, app):
+    from app.services.local_fallback import save_pending_upload
+    with app.app_context():
+        mongo_id = create_video(video_doc("atlas-only.mp4", "complete"))
+        save_pending_upload({**video_doc("unsynced-local.mp4", "queued"),
+                             "upload_request_id": "reports-local-probe"}, "isolated test")
+        videos, _events, source = report_data_with_source()
+        assert source == "mongodb"
+        assert any(str(row["_id"]) == str(mongo_id) for row in videos)
+        assert not any(row.get("original_filename") == "unsynced-local.mp4" for row in videos)
+        app.extensions["mongo_available"] = False
+        app.extensions["mongo_retry_at"] = float("inf")
+        videos, _events, source = report_data_with_source()
+        assert source == "local_fallback"
+        assert any(row.get("original_filename") == "unsynced-local.mp4" for row in videos)
+    page = client.get("/reports")
+    assert page.status_code == 200 and b"Data source: Local fallback" in page.data
+
+
+def test_reports_server_pagination_and_expandable_details(client, app):
+    with app.app_context():
+        for index in range(18):
+            create_video({**video_doc(f"paged-{index:02d}.mp4", "complete"),
+                          "upload_date": datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=index)})
+    first = client.get("/reports?tab=videos")
+    second = client.get("/reports?tab=videos&video_page=2")
+    assert first.status_code == second.status_code == 200
+    first_table = first.get_data(as_text=True).split('<table class="report-table">', 1)[1].split("</table>", 1)[0]
+    second_table = second.get_data(as_text=True).split('<table class="report-table">', 1)[1].split("</table>", 1)[0]
+    assert "paged-17.mp4" in first_table and "paged-02.mp4" not in first_table
+    assert "paged-02.mp4" in second_table and "paged-17.mp4" not in second_table
+    assert b"aria-expanded=\"false\"" in first.data and b"data-expand-report" in first.data
+    assert client.get("/static/js/reports.js").status_code == 200
+    assert client.get("/static/css/reports.css").status_code == 200
+
+
+def test_reports_review_save_failure_is_visible_without_false_success(client, app, monkeypatch):
+    import app.routes.incidents as incident_routes
+    event_id = str(ObjectId())
+
+    def unavailable(*_args, **_kwargs):
+        raise DatabaseUnavailable("isolated test outage")
+
+    monkeypatch.setattr(incident_routes, "update_incident", unavailable)
+    response = client.post(f"/incidents/{event_id}/review", data={
+        "csrf_token": csrf(client), "status": "reviewing", "review_notes": "No write confirmed.",
+        "next": "/reports?tab=timeline"})
+    assert response.status_code == 302
+    page = client.get(response.location)
+    assert b"Review was not saved" in page.data
+    assert b"Incident review saved" not in page.data
+
+
+def test_reports_empty_store_renders_every_tab_without_missing_review_context(client, app):
+    response = client.get("/reports")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+    assert 'id="panel-overview"' in html and 'id="panel-videos"' in html
+    assert 'id="panel-timeline"' in html and 'id="panel-evidence"' in html
+    assert 'id="panel-export"' in html
+    assert "New / not reviewed" in html and "No candidate episodes in this range" in html
+
+
+def test_shared_navbar_assets_and_links_render_correctly_on_all_pages(client, app):
+    paths = ["/dashboard", "/upload", "/history", "/incidents", "/reports", "/about"]
+    for path in paths:
+        response = client.get(path)
+        assert response.status_code == 200, path
+        html = response.get_data(as_text=True)
+        assert 'href="/static/css/style.css"' in html
+        assert 'href="/static/css/branding.css"' in html
+        assert "branding.css<link" not in html
+        for route in ("/dashboard", "/upload", "/history", "/incidents", "/reports", "/about"):
+            assert f'href="{route}"' in html
+        assert 'href="/upload">New analysis' in html
+        assert html.index('class="brand"') < html.index('class="nav-links"') < html.index('class="nav-cta"')
+    assert 'href="/static/css/reports.css"' in client.get("/reports").get_data(as_text=True)
+    assert 'href="/static/css/reports.css"' not in client.get("/dashboard").get_data(as_text=True)
 
 
 def test_analysis_settings_parent_and_fight_child_update_without_mongo_path_conflict(app):

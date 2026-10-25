@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from bson import ObjectId
 from bson.errors import InvalidId
 from pymongo import DESCENDING
@@ -995,17 +996,54 @@ def delete_video(video_id):
     return row
 
 
-def report_data(start=None, end=None):
-    query = {}
+def _report_date_bounds(start=None, end=None):
+    """Convert inclusive report calendar dates (entered/displayed in IST) to UTC."""
+    ist = ZoneInfo("Asia/Kolkata")
     date_filter = {}
     if start:
-        date_filter["$gte"] = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        date_filter["$gte"] = datetime.strptime(start, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=ist).astimezone(timezone.utc)
     if end:
-        date_filter["$lt"] = (datetime.strptime(end, "%Y-%m-%d") + timedelta(days=1)).replace(tzinfo=timezone.utc)
+        next_day = datetime.strptime(end, "%Y-%m-%d") + timedelta(days=1)
+        date_filter["$lt"] = next_day.replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=ist).astimezone(timezone.utc)
+    return date_filter
+
+
+def _report_date_matches(value, start=None, end=None):
+    """Compare BSON and legacy ISO timestamps by their displayed IST date."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return not (start or end)
+    if not isinstance(value, datetime):
+        return not (start or end)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    date_value = value.astimezone(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    return (not start or date_value >= start) and (not end or date_value <= end)
+
+
+def report_data_with_source(start=None, end=None):
+    """Read report records from one authoritative store for this request.
+
+    Local-only fallback rows are not merged with Atlas rows when Atlas is
+    available: local records have no synchronization marker and could
+    otherwise be counted alongside an unrelated or later imported document.
+    """
+    query = {}
+    date_filter = _report_date_bounds(start, end)
     if date_filter:
-        query["upload_date"] = date_filter
+        # Keep legacy ISO strings readable while still using the indexed BSON
+        # date range for current records. String values are post-filtered with
+        # the same timezone-aware rule below.
+        query["$or"] = [{"upload_date": date_filter}, {"upload_date": {"$type": "string"}}]
     def find(db):
         videos = list(db.videos.find(query).sort("upload_date", DESCENDING).limit(5000))
+        videos = [row for row in videos if _report_date_matches(row.get("upload_date"), start, end)]
+        videos.sort(key=lambda row: (utc_datetime_sort_key(row.get("upload_date")), str(row.get("_id", ""))),
+                    reverse=True)
         ids = [v["_id"] for v in videos]
         events = list(db.detection_events.find({"video_id": {"$in": ids}, "superseded": {"$ne": True}}).sort("timestamp_seconds", 1)) if ids else []
         names = {v["_id"]: v.get("original_filename", "") for v in videos}
@@ -1014,24 +1052,21 @@ def report_data(start=None, end=None):
         return videos, events
     try:
         videos, events = _run(find)
+        return videos, events, "mongodb"
     except DatabaseUnavailable:
-        videos, events = [], []
+        pass
     from app.services.local_fallback import list_pending_videos
     local, _ = list_pending_videos(page=1, per_page=5000)
-    def in_range(row):
-        value = row.get("upload_date")
-        if isinstance(value, datetime):
-            value = value.date().isoformat()
-        elif isinstance(value, str):
-            value = value[:10]
-        else:
-            return not (start or end)
-        return (not start or value >= start) and (not end or value <= end)
-    local = [row for row in local if in_range(row)]
-    videos.extend(local)
-    events.extend(event for row in local for event in row.get("local_events", [])
-                  if event.get("superseded") is not True)
+    local = [row for row in local if _report_date_matches(row.get("upload_date"), start, end)]
     local_names = {str(row.get("_id")): row.get("original_filename", "") for row in local}
+    events = [event for row in local for event in row.get("local_events", [])
+              if event.get("superseded") is not True]
     for event in events:
         event["original_filename"] = event.get("original_filename") or local_names.get(str(event.get("video_id")), "")
+    return local, events, "local_fallback"
+
+
+def report_data(start=None, end=None):
+    """Backward-compatible tuple API for existing report callers."""
+    videos, events, _source = report_data_with_source(start, end)
     return videos, events

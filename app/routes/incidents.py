@@ -2,6 +2,7 @@ from datetime import datetime, time as day_time, timedelta, timezone
 
 from flask import Blueprint, abort, flash, redirect, render_template, request, url_for
 
+from app.db import DatabaseUnavailable
 from app.services.repository import get_video, list_incidents, object_id, update_incident
 from app.services.timestamps import event_video_seconds, format_video_timestamp
 
@@ -63,10 +64,15 @@ def review(event_id):
     status = request.form.get("status", "")
     if status not in INCIDENT_STATUSES:
         abort(400)
-    if not update_incident(event_id, status, request.form.get("review_notes", "")):
-        abort(404)
-    flash("Incident review saved.", "success")
     next_url = request.form.get("next", "")
     if not next_url.startswith("/") or next_url.startswith("//"):
         next_url = url_for("incidents.incident_list")
+    try:
+        saved = update_incident(event_id, status, request.form.get("review_notes", ""))
+    except DatabaseUnavailable:
+        flash("Review was not saved because the database and local fallback are unavailable. Please retry.", "error")
+        return redirect(next_url)
+    if not saved:
+        abort(404)
+    flash("Incident review saved.", "success")
     return redirect(next_url)
