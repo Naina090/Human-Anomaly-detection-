@@ -53,6 +53,16 @@ def history():
         video["pose_analysis"] = video.get("pose_analysis") or {"status": "not_configured"}
         video["object_analysis"] = video.get("object_analysis") or {"status": "not_configured"}
         video["fight_analysis"] = video.get("fight_analysis") or {"status": "not_configured"}
+        video["lighting_analysis"] = video.get("lighting_analysis") or {"status": "not_recorded", "warnings": []}
+        video["movement_analysis"] = video.get("movement_analysis") or {"status": "not_recorded"}
+        video["lighting_mode_display"] = (video.get("lighting_mode") or
+            video["lighting_analysis"].get("lighting_mode") or "Not recorded")
+        video["detected_lighting_mode_display"] = video["lighting_analysis"].get("detected_mode") or "Not recorded"
+        video["night_enhancement_display"] = ("Applied" if video.get("night_enhancement_applied") is True else
+            "Not applied" if video.get("night_enhancement_applied") is False and
+            video["lighting_analysis"].get("status") == "complete" else "Not recorded")
+        video["movement_observation_count"] = len(video.get("movement_observations") or [])
+        video["motion_analytics"] = video.get("motion_analytics") or {"status": "not_recorded", "measurement_count": 0}
         video["suspected_fighting_count"] = video.get("suspected_fighting_count", 0)
         entry = video.get("latest_restricted_zone_entry")
         seconds = event_video_seconds(entry)

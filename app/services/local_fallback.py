@@ -502,6 +502,58 @@ def get_pending_frames(identifier, kind, limit=1200):
     return (row.get(key) or [])[:max(1, min(2000, int(limit)))]
 
 
+def _motion_sidecar_path(identifier, run_id):
+    # Both components are generated ObjectIds; validate before constructing a
+    # path so user-supplied IDs can never escape the fallback directory.
+    import re
+    video_id, run_id = str(identifier), str(run_id)
+    if not re.fullmatch(r"[0-9a-fA-F]{24}", video_id) or not re.fullmatch(r"[0-9a-fA-F]{24}", run_id):
+        raise ValueError("Invalid motion analytics storage identifier.")
+    return _path() + ".motion" + os.sep + video_id.lower() + "_" + run_id.lower() + ".jsonl"
+
+
+def save_pending_motion_measurements(identifier, run_id, measurements):
+    """Append a bounded frame batch to local fallback without growing history JSON."""
+    with _lock:
+        row = next((item for item in _read() if item.get("_id") == str(identifier)), None)
+        if not row or not row.get("local_only"):
+            return None
+        path = _motion_sidecar_path(identifier, run_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as stream:
+            for item in measurements or []:
+                record = {**item, "video_id": str(identifier), "analysis_run_id": str(run_id)}
+                stream.write(json.dumps(record, default=_json_default, ensure_ascii=False,
+                                        separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        return len(measurements or [])
+
+
+def get_pending_motion_measurements(identifier, run_id):
+    """Read one run's append-only frame rows; legacy data stays untouched."""
+    return list(iter_pending_motion_measurements(identifier, run_id))
+
+
+def iter_pending_motion_measurements(identifier, run_id):
+    """Yield frame rows with bounded memory while keeping appends serialized."""
+    def read_rows():
+        with _lock:
+            path = _motion_sidecar_path(identifier, run_id)
+            try:
+                with open(path, "r", encoding="utf-8") as stream:
+                    for line in stream:
+                        try:
+                            value = json.loads(line)
+                        except (ValueError, TypeError):
+                            continue
+                        if isinstance(value, dict):
+                            yield value
+            except FileNotFoundError:
+                return
+    return read_rows()
+
+
 def retry_pending_video(identifier):
     """Create a fresh local job and clear prior attempt evidence atomically."""
     with _lock:

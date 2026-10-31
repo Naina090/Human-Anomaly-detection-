@@ -3,6 +3,31 @@
 <form id="upload-form" class="upload-panel" action="{{ url_for('videos.upload') }}" method="post" enctype="multipart/form-data" data-max-bytes="{{ max_mb * 1024 * 1024 }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="upload_request_id" value="{{ upload_request_id }}"><input id="roi-zones" type="hidden" name="roi_zones" value="[]">
 <label class="dropzone" for="video"><span class="upload-icon">⇧</span><strong>Drop a video here</strong><span>or browse from this device</span><span class="button secondary">Choose video</span><small>MP4 · AVI · MOV · MKV · Up to {{ max_mb }} MB</small><input id="video" type="file" name="video" accept="video/mp4,video/avi,video/quicktime,video/x-matroska,.mp4,.avi,.mov,.mkv" required></label>
 <div id="preview-wrap" class="preview-wrap" hidden><video id="preview" controls></video><span id="file-name"></span><span id="file-size"></span></div>
+<section class="lighting-config" aria-labelledby="lighting-heading" data-threshold="{{ lighting_threshold }}">
+  <div><h2 id="lighting-heading">Automatic Night Vision &amp; Movement Analysis</h2>
+    <p>Automatically detects low-light footage and enhances visibility for human pose and movement analysis.</p>
+  </div>
+  <label for="lighting-mode">Lighting Mode
+    <select id="lighting-mode" name="lighting_mode">
+      <option value="auto" selected>Auto Detect</option>
+      <option value="day">Day Mode</option>
+      <option value="night_vision">Night Vision Mode</option>
+    </select>
+  </label>
+  <label for="motion-overlay-mode">Motion overlay
+    <select id="motion-overlay-mode" name="motion_overlay_mode">
+      <option value="skeleton_only">Skeleton only</option>
+      <option value="skeleton_tracking" selected>Skeleton + tracking ID</option>
+      <option value="joint_angles">Skeleton + selected joint angles</option>
+      <option value="movement">Skeleton + movement information</option>
+      <option value="full">Full motion overlay</option>
+    </select>
+  </label>
+  <p id="lighting-preview-status" role="status" aria-live="polite">Lighting will be assessed from multiple video frames after upload.</p>
+  <details><summary>How this analysis works</summary>
+    <p>Lighting is assessed across representative frames. Low-light enhancement uses local contrast and controlled brightness adjustment; it cannot recover details absent from the source. Existing pose keypoints and temporary per-video tracks are used for movement observations. Movement labels are not anomaly findings or identity claims.</p>
+  </details>
+</section>
 <section id="zone-config" class="zone-config" aria-labelledby="zone-heading">
   <div class="zone-heading"><div><h2 id="zone-heading">Smart Surveillance Zone Configuration</h2><p>Select a video frame and click Draw Zone. Click at least 3 points around the restricted area, then Finish Polygon.</p></div><label class="zone-toggle"><input id="zone-enabled" type="checkbox" checked> Enable zones</label></div>
   <div class="zone-stage-wrap" hidden>

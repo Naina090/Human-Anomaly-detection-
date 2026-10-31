@@ -23,6 +23,9 @@ def report_lines(video, job, events):
     pose = video.get("pose_analysis") or {}
     objects = video.get("object_analysis") or {}
     fighting = video.get("fight_analysis") or {}
+    lighting = video.get("lighting_analysis") or {}
+    movement_analysis = video.get("movement_analysis") or {}
+    movement_observations = video.get("movement_observations") or []
     annotated = video.get("annotated_output_metadata") or {}
     episodes = group_event_episodes(events)
     categories = {}
@@ -42,6 +45,14 @@ def report_lines(video, job, events):
         f"Job started: {_display((job or {}).get('started_at'))}",
         f"Job completed: {_display((job or {}).get('completed_at'))}",
         f"Frame sample interval (seconds): {_display(settings.get('sample_every_seconds'))}",
+        f"Lighting mode: {_display(video.get('lighting_mode') or lighting.get('lighting_mode'))}",
+        f"Detected lighting condition: {_display(lighting.get('detected_mode'))}",
+        f"Average brightness (grayscale 0-255): {_display(video.get('average_brightness'))}",
+        f"Night enhancement applied: {_display(video.get('night_enhancement_applied'))}",
+        f"Movement observation status: {_display(movement_analysis.get('status'))}",
+        f"Movement observations (separate from anomaly events): {len(movement_observations)}",
+        f"Tracked person count estimate: {_display(movement_analysis.get('tracked_person_count'))}",
+        "Low-visibility warnings: " + ("; ".join(str(item) for item in (lighting.get("warnings") or [])) or "None recorded"),
         f"Pose detector: {_display(pose.get('model_name'))} / {_display(pose.get('status'))}",
         f"Object detector: {_display(objects.get('model_name'))} / {_display(objects.get('status'))}",
         f"Object observations by class: {_display(objects.get('counts_by_class') or 'No saved class counts')}",
@@ -57,8 +68,24 @@ def report_lines(video, job, events):
         "Episodes by category: " + (", ".join(f"{name}: {count}" for name, count in sorted(categories.items()))
                                      if categories else "No saved anomaly-candidate episodes"),
         "",
-        "Chronological event timeline (all individual stored events retained):",
+        "Movement observations (ordinary motion summaries, not anomaly events):",
     ]
+    for index, observation in enumerate(movement_observations[:1000], 1):
+        start = observation.get("start_timestamp_seconds")
+        end = observation.get("end_timestamp_seconds")
+        interval = (f"{format_video_timestamp(start)} to {format_video_timestamp(end)}"
+                    if isinstance(start, (int, float)) and isinstance(end, (int, float)) and end > start
+                    else format_video_timestamp(start) if isinstance(start, (int, float)) else "time unavailable")
+        lines.append(f"Movement {index}: {observation.get('category', 'observation')} at {interval}; "
+                     f"temporary track {observation.get('track_id', 'unavailable')}; "
+                     f"lighting {observation.get('lighting_mode', 'not recorded')}; "
+                     f"{observation.get('evidence_observations', 0)} supporting observations. "
+                     "This is a movement summary, not an anomaly or identity assessment.")
+    if not movement_observations:
+        lines.append("No movement observations were saved.")
+    lines.extend([
+        "Chronological event timeline (all individual stored events retained):",
+    ])
     for index, event in enumerate(events[:2000], 1):
         timestamp_text = format_video_timestamp(event_video_seconds(event)) or "time unavailable"
         score = event.get("model_score", event.get("anomaly_score"))

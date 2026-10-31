@@ -121,6 +121,13 @@ def init_database(app):
                                               name="face_frames_video_time")
         db.pose_detection_frames.create_index([("video_id", 1), ("timestamp_seconds", 1)],
                                               name="pose_frames_video_time")
+        db.motion_analytics_frames.create_index(
+            [("video_id", 1), ("analysis_run_id", 1), ("timestamp_seconds", 1), ("track_id", 1)],
+            name="motion_frames_video_run_time")
+        db.motion_analytics_frames.create_index(
+            [("video_id", 1), ("analysis_run_id", 1), ("frame_number", 1),
+             ("track_id", 1), ("track_segment_id", 1)],
+            unique=True, name="motion_frames_run_frame_track")
         app.extensions["mongo_available"] = True
         app.extensions["mongo_retry_at"] = 0.0
     except PyMongoError as exc:

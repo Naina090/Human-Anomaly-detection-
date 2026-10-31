@@ -107,8 +107,8 @@ def make_video(path):
     return path.read_bytes()
 
 
-def wait_for_status(app, video_id, statuses=("complete", "failed")):
-    deadline = time.monotonic() + 5
+def wait_for_status(app, video_id, statuses=("complete", "failed"), timeout=15):
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         row = app.extensions["mongo_db"].videos.find_one({"_id": ObjectId(video_id)})
         if row and row["processing_status"] in statuses:
@@ -941,13 +941,16 @@ def test_enabled_zone_uses_configured_tracking_cadence_only_when_active(tmp_path
     detector = CountingDetector()
     zone_result = analyze_video(str(source), 1.0, 30, detector, zones=zones,
                                 zone_sample_seconds=.5)
-    assert detector.calls == 2
+    assert detector.calls == zone_result["motion_analytics"]["decoded_frames"] == 10
+    assert zone_result["motion_analytics"]["pose_inference_attempted_frames"] == 10
+    assert zone_result["motion_analytics"]["frames_without_people"] == 10
+    assert zone_result["pose_analysis"]["frames_sampled"] == 2
     assert zone_result["sample_interval_seconds"] == .5
     detector = CountingDetector()
     normal_result = analyze_video(str(source), 1.0, 30, detector,
                                   zones=[{**zones[0], "enabled": False}],
                                   zone_sample_seconds=.5)
-    assert detector.calls == 1
+    assert detector.calls == normal_result["motion_analytics"]["decoded_frames"] == 10
     assert normal_result["sample_interval_seconds"] == 1.0
 
 
@@ -2385,6 +2388,263 @@ def test_reports_empty_store_renders_every_tab_without_missing_review_context(cl
     assert 'id="panel-timeline"' in html and 'id="panel-evidence"' in html
     assert 'id="panel-export"' in html
     assert "New / not reviewed" in html and "No candidate episodes in this range" in html
+
+
+def test_lighting_and_movement_metadata_render_on_results_history_and_reports(client, app):
+    with app.app_context():
+        video_id = create_video({**video_doc("night-review.avi", "complete"),
+            "lighting_mode": "NIGHT_VISION", "average_brightness": 26.4,
+            "night_enhancement_applied": True,
+            "lighting_analysis": {"status": "complete", "requested_mode": "AUTO",
+                "detected_mode": "LOW_LIGHT", "lighting_mode": "NIGHT_VISION",
+                "average_brightness": 26.4, "warnings": ["Synthetic low-light fixture warning."]},
+            "movement_analysis": {"status": "complete", "observation_count": 1,
+                                   "tracked_person_count": 1},
+            "movement_observations": [{"track_id": 3, "track_segment_id": "3:movement1",
+                "category": "walking_like_movement", "lighting_mode": "NIGHT_VISION",
+                "start_timestamp_seconds": 1.2, "end_timestamp_seconds": 2.2,
+                "evidence_observations": 3,
+                "interpretation": "Pose fixture summary only."}]})
+    results = client.get(f"/results/{video_id}")
+    assert results.status_code == 200
+    for text in ("Night Vision &amp; Movement Analysis", "LOW_LIGHT", "NIGHT_VISION",
+                 "Walking Like Movement", "Synthetic low-light fixture warning.",
+                 "separate from anomaly events"):
+        assert text.encode() in results.data
+    history = client.get("/history")
+    assert history.status_code == 200
+    assert b"NIGHT_VISION" in history.data and b"Automatic assessment" in history.data
+    reports = client.get("/reports?tab=videos&lighting_mode=LOW_LIGHT")
+    assert reports.status_code == 200
+    assert b"night-review.avi" in reports.data
+    assert b"walking_like_movement" not in reports.data
+    report_csv = client.get("/reports.csv")
+    assert b"lighting_mode" in report_csv.data and b"movement_observation_count" in report_csv.data
+    rows = list(__import__("csv").DictReader(io.StringIO(report_csv.get_data(as_text=True))))
+    video_row = next(row for row in rows if row["record_type"] == "video")
+    assert video_row["detected_lighting_mode"] == "LOW_LIGHT"
+    assert video_row["movement_observation_count"] == "1"
+    from app.services.pdf_report import report_lines
+    pdf_lines = report_lines({"_id": "night-report", "original_filename": "night-review.avi",
+                     "lighting_mode": "NIGHT_VISION", "average_brightness": 26.4,
+                     "night_enhancement_applied": True,
+                     "lighting_analysis": {"detected_mode": "LOW_LIGHT", "warnings": ["Low visibility"]},
+                     "movement_analysis": {"status": "complete", "tracked_person_count": 1},
+                     "movement_observations": [{"track_id": 3, "category": "walking_like_movement",
+                         "lighting_mode": "NIGHT_VISION", "start_timestamp_seconds": 1.2,
+                         "end_timestamp_seconds": 2.2, "evidence_observations": 3}]},
+                        {"status": "completed"}, [])
+    report_text = "\n".join(pdf_lines).encode()
+    assert b"Movement observations (separate from anomaly events): 1" in report_text
+    assert b"Low visibility" in report_text and b"walking_like_movement" in report_text
+    video_csv = video_report_csv({"_id": "night-report", "original_filename": "night-review.avi",
+                                  "lighting_mode": "NIGHT_VISION",
+                                  "movement_observations": [{"track_id": 3,
+                                      "category": "walking_like_movement",
+                                      "start_timestamp_seconds": 1.2,
+                                      "end_timestamp_seconds": 2.2,
+                                      "evidence_observations": 3}]}, [])
+    movement_row = next(row for row in __import__("csv").DictReader(io.StringIO(video_csv))
+                        if row["record_type"] == "movement_observation")
+    assert movement_row["label"] == "walking_like_movement"
+    assert movement_row["track_id"] == "3"
+
+
+def test_motion_analytics_api_filters_paginates_and_exports_saved_measurements(client, app):
+    with app.app_context():
+        video_id = create_video({**video_doc("motion-samples.mp4", "complete"),
+            "pose_analysis": {"status": "complete", "person_track_count_estimate": 2},
+            "motion_analytics": {"status": "complete", "sampling_basis": "sampled pose frames",
+                "coordinate_note": "2D estimate", "measurement_count": 3,
+                "dropped_measurement_count": 0, "max_measurements": 2000,
+                "measurements": [
+                    {"track_id": 1, "frame_number": 10, "timestamp_seconds": 1.0,
+                     "lighting_mode": "DAY", "body_center_x_pixels": 20,
+                     "body_center_y_pixels": 30, "body_center_reference": "midpoint_between_visible_hips",
+                     "movement_speed_pixels_per_second": None, "movement_direction_degrees": None,
+                     "joint_measurements": {"left_knee": {"raw_angle_degrees": 90.12345,
+                         "smoothed_angle_degrees": 90.0, "angular_change_degrees": None,
+                         "angular_velocity_degrees_per_second": None, "keypoint_confidence": .9}}},
+                    {"track_id": 1, "frame_number": 20, "timestamp_seconds": 2.0,
+                     "lighting_mode": "DAY", "body_center_x_pixels": 30,
+                     "body_center_y_pixels": 30, "body_center_reference": "midpoint_between_visible_hips",
+                     "movement_speed_pixels_per_second": 10.0, "movement_direction_degrees": 0,
+                     "joint_measurements": {"left_knee": {"raw_angle_degrees": 100.0,
+                         "smoothed_angle_degrees": 95.0, "angular_change_degrees": 10.0,
+                         "angular_velocity_degrees_per_second": 10.0, "keypoint_confidence": .8}}},
+                    {"track_id": 2, "frame_number": 20, "timestamp_seconds": 2.0,
+                     "lighting_mode": "NIGHT_VISION", "body_center_x_pixels": 40,
+                     "body_center_y_pixels": 30, "body_center_reference": "midpoint_between_visible_hips",
+                     "movement_speed_pixels_per_second": 5.0, "movement_direction_degrees": 0,
+                     "movement_observation": "=HYPERLINK(\"https://invalid\")",
+                     "joint_measurements": {"right_elbow": {"raw_angle_degrees": 80.0,
+                         "smoothed_angle_degrees": 80.0, "angular_change_degrees": -4.0,
+                         "angular_velocity_degrees_per_second": -4.0, "keypoint_confidence": .7}}},
+                ]}})
+    response = client.get(f"/api/videos/{video_id}/motion-analytics?person=1&joint=left_knee&limit=1&page=2")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["measurement_count"] == 2 and payload["page"] == 2
+    assert payload["rows"][0]["frame_number"] == 20
+    assert payload["rows"][0]["joint_measurements"]["left_knee"]["angular_velocity_degrees_per_second"] == 10.0
+    assert len(payload["graph_rows"]) == 2
+    assert client.get(f"/api/videos/{video_id}/motion-analytics?start=3&end=1").status_code == 400
+    csv_response = client.get(f"/results/{video_id}/motion-analytics.csv?person=2&joint=right_elbow")
+    assert csv_response.status_code == 200 and csv_response.mimetype == "text/csv"
+    csv_text = csv_response.get_data(as_text=True)
+    assert "right_elbow" in csv_text and "80.123" not in csv_text
+    assert "'=HYPERLINK" in csv_text and "http://" not in csv_text
+    result_page = client.get(f"/results/{video_id}")
+    assert result_page.status_code == 200
+    assert b"Human Motion Analytics" in result_page.data
+    assert b"Person/frame measurements" in result_page.data
+    assert b"Download motion CSV" in result_page.data
+
+
+def test_motion_analytics_survives_local_fallback_reload_and_renders(client, app):
+    from app.services.local_fallback import get_pending_video, save_pending_upload
+    from app.services.repository import update_video
+
+    with app.app_context():
+        video_id, job_id = save_pending_upload(
+            {**video_doc("local-motion.mp4", "queued"), "pose_analysis": {"status": "complete"}},
+            "isolated test fallback",
+        )
+        sample = {
+            "video_id": video_id, "track_id": 9, "track_segment_id": "9:pose1",
+            "frame_number": 45, "timestamp_seconds": 4.5, "lighting_mode": "NIGHT_VISION",
+            "joint_measurements": {"left_knee": {"raw_angle_degrees": 92.125,
+                "smoothed_angle_degrees": 91.5, "angular_change_degrees": 2.0,
+                "angular_velocity_degrees_per_second": 4.0, "keypoint_confidence": .91}},
+            "body_center_x_pixels": 21.0, "body_center_y_pixels": 32.0,
+            "body_center_x_normalized": .21, "body_center_y_normalized": .32,
+            "movement_speed_pixels_per_second": 8.0, "movement_direction_degrees": 0.0,
+        }
+        assert update_video(video_id, {"processing_status": "complete",
+            "motion_analytics": {"status": "complete", "measurement_count": 1,
+                                  "measurements": [sample]}})
+        reloaded = get_pending_video(video_id)
+        assert reloaded["motion_analytics"]["measurements"][0]["track_id"] == 9
+        assert reloaded["motion_analytics"]["measurements"][0]["timestamp_seconds"] == 4.5
+        assert reloaded["motion_analytics"]["measurements"][0]["lighting_mode"] == "NIGHT_VISION"
+        assert reloaded["local_job"]["_id"] == job_id
+
+    response = client.get(f"/api/videos/{video_id}/motion-analytics?person=9&joint=left_knee")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["rows"][0]["timestamp_seconds"] == 4.5
+    assert payload["rows"][0]["joint_measurements"]["left_knee"]["raw_angle_degrees"] == 92.125
+    result_page = client.get(f"/results/{video_id}")
+    assert result_page.status_code == 200 and b"Human Motion Analytics" in result_page.data
+
+
+def test_motion_analytics_empty_records_render_honest_results_state(client, app):
+    with app.app_context():
+        video_id = create_video({**video_doc("older-motion-record.mp4", "complete"),
+                                 "pose_analysis": {"status": "not_configured"}})
+    response = client.get(f"/results/{video_id}")
+    assert response.status_code == 200
+    assert b"Human Motion Analytics" in response.data
+    assert b"No pose measurements were saved" in response.data
+    assert b"motion-analytics.js" in response.data
+
+
+def test_frame_level_motion_records_stream_through_local_fallback_and_export(client, app):
+    from app.services.local_fallback import get_pending_video, save_pending_upload
+    from app.services.repository import save_motion_measurements, update_video
+    with app.app_context():
+        video_id, job_id = save_pending_upload(video_doc("frame-level.mp4", "queued"),
+                                                "isolated frame analytics test")
+        run_id = job_id
+        rows = [
+            {"track_id": 4, "track_segment_id": "4:pose1", "frame_number": index,
+             "timestamp_seconds": index / 30, "source_fps": 30,
+             "lighting_mode": "DAY", "joint_measurements": {
+                 "left_elbow": {"raw_angle_degrees": 90 + index,
+                     "smoothed_angle_degrees": 90 + index, "angular_velocity_degrees_per_second": 30,
+                     "keypoint_confidence": .9}},
+             "movement_speed_pixels_per_second": 12.0}
+            for index in range(3)
+        ]
+        assert save_motion_measurements(video_id, run_id, rows) == 3
+        assert update_video(video_id, {"processing_status": "complete", "motion_analytics": {
+            "status": "complete", "storage": "frame_collection", "analysis_run_id": run_id,
+            "measurement_count": 3, "sampling_basis": "every decoded frame"}})
+        assert len(get_pending_video(video_id)["motion_analytics"]) > 0
+    response = client.get(f"/api/videos/{video_id}/motion-analytics?person=4&joint=left_elbow&limit=2&page=2")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["measurement_count"] == 3
+    assert data["rows"][0]["frame_number"] == 2
+    assert data["rows"][0]["source_fps"] == 30
+    exported = client.get(f"/results/{video_id}/motion-analytics.csv?person=4&joint=left_elbow")
+    assert exported.status_code == 200
+    text = exported.get_data(as_text=True)
+    assert "video_timestamp_seconds" in text and "0.0667" in text and "left_elbow" in text
+
+
+def test_pose_inference_failure_is_counted_and_later_frames_are_still_attempted(tmp_path):
+    from app.services.video_processor import analyze_video
+    source = tmp_path / "frame-failure.avi"
+    make_video(source)
+
+    class IntermittentPose:
+        METHOD = "intermittent test fixture"
+        def __init__(self): self.calls = 0
+        def inspect_with_evidence(self, frame, timestamp, update_transition=True):
+            current = self.calls
+            self.calls += 1
+            if current == 2:
+                raise ValueError("fixture failure")
+            return frame, None, {"person_count": 0, "people": []}
+
+    detector = IntermittentPose()
+    result = analyze_video(str(source), 1.0, 10, detector, requested_lighting_mode="day")
+    stats = result["motion_analytics"]
+    assert detector.calls == stats["decoded_frames"] == 10
+    assert stats["pose_inference_attempted_frames"] == 10
+    assert stats["pose_processed_frames"] == 9
+    assert stats["pose_failed_frames"] == 1
+    assert stats["frames_without_people"] == 9
+
+
+def test_frame_level_motion_measurements_use_additive_mongo_collection(app):
+    from app.services.repository import (count_motion_measurements, create_video,
+        get_motion_measurements, save_motion_measurements, update_video)
+    run_id = ObjectId()
+    with app.app_context():
+        video_id = create_video({**video_doc("mongo-frame-level.mp4", "processing"),
+            "motion_analytics": {"status": "processing"}})
+        batch = [{"track_id": 6, "track_segment_id": "6:pose1", "frame_number": frame,
+            "timestamp_seconds": frame / 24, "source_fps": 24,
+            "joint_measurements": {"left_knee": {"raw_angle_degrees": 110.0,
+                "smoothed_angle_degrees": 109.0, "angular_change_degrees": 1.0,
+                "angular_velocity_degrees_per_second": 24.0, "keypoint_confidence": .88}}}
+            for frame in range(4)]
+        assert save_motion_measurements(str(video_id), str(run_id), batch) == 4
+        assert save_motion_measurements(str(video_id), str(run_id), batch) == 4
+        assert update_video(str(video_id), {"motion_analytics": {"status": "complete",
+            "storage": "frame_collection", "analysis_run_id": str(run_id), "measurement_count": 4}})
+        assert count_motion_measurements(str(video_id), str(run_id), person=6, joint="left_knee") == 4
+        retrieved = get_motion_measurements(str(video_id), str(run_id), person=6,
+            joint="left_knee", skip=2, limit=1)
+        assert retrieved[0]["frame_number"] == 2
+        assert retrieved[0]["source_fps"] == 24
+
+
+def test_upload_form_has_default_auto_lighting_and_rejects_unknown_mode(client, app, tmp_path):
+    response = client.get("/upload")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+    assert 'name="lighting_mode"' in html and 'value="auto" selected' in html
+    assert "Automatically detects low-light footage" in html
+    assert "lighting-preview-status" in html
+    before = app.extensions["mongo_db"].videos.count_documents({})
+    token = csrf(client)
+    response = client.post("/upload", data={"csrf_token": token, "lighting_mode": "twilight",
+        "video": (io.BytesIO(b"invalid"), "not-used.avi")}, content_type="multipart/form-data")
+    assert response.status_code == 302
+    assert app.extensions["mongo_db"].videos.count_documents({}) == before
 
 
 def test_shared_navbar_assets_and_links_render_correctly_on_all_pages(client, app):

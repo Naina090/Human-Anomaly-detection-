@@ -9,11 +9,12 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
-from flask import Blueprint, current_app, render_template, request, redirect, url_for, flash, send_file, abort, jsonify, Response
+from flask import Blueprint, current_app, render_template, request, redirect, url_for, flash, send_file, abort, jsonify, Response, stream_with_context
 from werkzeug.utils import secure_filename
 from app.services.repository import (create_video, find_video_by_upload_request, get_video, get_events, update_video,
     create_job, update_job, get_job_for_video, get_face_frames, save_face_frames,
-    get_pose_frames, save_pose_frames, claim_job)
+    get_pose_frames, save_pose_frames, save_motion_measurements, get_motion_measurements,
+    count_motion_measurements, summarize_motion_measurements, claim_job)
 from app.db import DatabaseUnavailable
 from app.services.storage import safe_video_path, safe_processed_path
 from app.services.video_processor import (analyze_video, VideoError, make_browser_playable_webm,
@@ -24,14 +25,17 @@ from app.services.face_detector import OpenCVFaceDetector, FaceDetectorUnavailab
 from app.services.object_detector import (ObjectDetectorUnavailable, YoloObjectTracker,
     detector_status as object_detector_status)
 from app.services.fight_detector import FightActionDetector, FightDetectorUnavailable
-from app.services.report_service import build_analysis_summary, video_report_csv, explain_event
+from app.services.report_service import (build_analysis_summary, video_report_csv,
+                                         motion_analytics_csv, explain_event)
 from app.services.pdf_report import build_pdf
 from app.services.video_validator import validate_video_file, VideoValidationError
 from app.services.roi import ZoneValidationError, parse_zones
+from app.services.lighting import LIGHTING_MODES
 from app.logging_utils import sanitized_traceback
 
 bp = Blueprint("videos", __name__)
 log = logging.getLogger(__name__)
+MOTION_OVERLAY_MODES = {"skeleton_only", "skeleton_tracking", "joint_angles", "movement", "full"}
 ALLOWED = {"mp4", "avi", "mov", "mkv"}
 
 
@@ -83,6 +87,7 @@ def group_object_observations(events):
 @bp.get("/upload")
 def upload_page():
     return render_template("upload.html", max_mb=current_app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024),
+                           lighting_threshold=current_app.config.get("LIGHTING_BRIGHTNESS_THRESHOLD", 70),
                            upload_request_id=uuid.uuid4().hex,
                            detector=detector_status(current_app.config.get("POSE_MODEL_PATH", "")),
                            face_detector=face_detector_status(current_app.config.get("FACE_CASCADE_PATH", "")),
@@ -106,6 +111,15 @@ def upload():
         zones = parse_zones(request.form.get("roi_zones"))
     except ZoneValidationError as exc:
         flash(str(exc), "error")
+        return redirect(url_for("videos.upload_page"))
+    lighting_mode = str(request.form.get("lighting_mode") or "auto").strip().lower()
+    if lighting_mode not in LIGHTING_MODES:
+        flash("Choose Auto Detect, Day Mode, or Night Vision Mode.", "error")
+        return redirect(url_for("videos.upload_page"))
+    motion_overlay_mode = str(request.form.get("motion_overlay_mode") or
+                               current_app.config.get("MOTION_OVERLAY_MODE", "skeleton_tracking")).strip().lower()
+    if motion_overlay_mode not in MOTION_OVERLAY_MODES:
+        flash("Choose a supported motion overlay mode.", "error")
         return redirect(url_for("videos.upload_page"))
     upload_request_id = request.form.get("upload_request_id", "")
     try:
@@ -177,6 +191,12 @@ def upload():
         "fight_analysis": {"status": "queued" if current_app.config.get("FIGHT_DETECTION_ENABLED") and current_app.config.get("FIGHT_MODEL_PATH") else
                            ("disabled" if not current_app.config.get("FIGHT_DETECTION_ENABLED") else "not_configured"),
                            "candidate_event_count": 0},
+        "lighting_mode": "pending",
+        "motion_overlay_mode": motion_overlay_mode,
+        "lighting_analysis": {"status": "queued", "requested_mode": lighting_mode.upper()},
+        "night_enhancement_applied": False,
+        "movement_analysis": {"status": "queued", "observation_count": 0,
+                              "tracked_person_count": 0, "observations": []},
     }
     try:
         record_id = create_video(document)
@@ -339,6 +359,7 @@ def _run_analysis(app, video_id, job_id, path):
                         "minimum_horizontal_persistence": app.config.get("FALL_MIN_HORIZONTAL_PERSISTENCE", .6),
                         "candidate_score_threshold": app.config.get("FALL_CANDIDATE_SCORE_THRESHOLD", .55),
                         "tracker": app.config.get("POSE_TRACKER", "bytetrack.yaml"),
+                        "overlay_mode": saved_video.get("motion_overlay_mode", app.config.get("MOTION_OVERLAY_MODE", "skeleton_tracking")),
                     })
                     worker_profile["pose_model_initialization_seconds"] = time.perf_counter() - stage_started
                 except DetectorUnavailable as exc:
@@ -385,13 +406,18 @@ def _run_analysis(app, video_id, job_id, path):
                 "candidate_event_count": 0,
                 "error_message": fight_init_error,
             }})
-            output_path = output_path if (detector or face_detector or object_detector or fight_detector or zones) else None
             last_progress = [-1]
             def record_progress(percent):
                 # Avoid rewriting the local JSON fallback for every source frame.
                 if percent != last_progress[0]:
                     last_progress[0] = percent
                     persist_call("persistence", update_job, job_id, {"progress_percent": percent})
+            lighting_settings = saved_video.get("lighting_analysis") or {}
+            requested_lighting_mode = str(lighting_settings.get("requested_mode", "AUTO")).lower()
+            def persist_motion_batch(rows):
+                saved = persist_call("persistence", save_motion_measurements, video_id, job_id, rows)
+                if saved != len(rows):
+                    raise RuntimeError("A frame-level motion analytics batch was not fully persisted.")
             result = analyze_video(path, app.config["SAMPLE_EVERY_SECONDS"], app.config["MAX_DURATION_SECONDS"], detector,
                                    record_progress, output_path,
                                    face_detector=face_detector, object_detector=object_detector, zones=zones,
@@ -401,7 +427,27 @@ def _run_analysis(app, video_id, job_id, path):
                                    zone_track_max_gap_seconds=app.config.get("ZONE_TRACK_MAX_GAP_SECONDS", 1.5),
                                    zone_boundary_margin_px=app.config.get("ZONE_BOUNDARY_MARGIN_PX", 8),
                                    fight_detector=fight_detector,
-                                   output_max_width=app.config.get("ANNOTATED_OUTPUT_MAX_WIDTH", 640))
+                                   output_max_width=app.config.get("ANNOTATED_OUTPUT_MAX_WIDTH", 640),
+                                   requested_lighting_mode=requested_lighting_mode,
+                                   lighting_sample_frames=app.config.get("LIGHTING_SAMPLE_FRAMES", 7),
+                                   lighting_brightness_threshold=app.config.get("LIGHTING_BRIGHTNESS_THRESHOLD", 70),
+                                   lighting_low_frame_fraction=app.config.get("LIGHTING_LOW_FRAME_FRACTION", 0.6),
+                                   night_enhancement_config={
+                                       "clip_limit": app.config.get("NIGHT_ENHANCEMENT_CLAHE_CLIP_LIMIT", 2.2),
+                                       "gamma": app.config.get("NIGHT_ENHANCEMENT_GAMMA", 0.78),
+                                       "brightness_offset": app.config.get("NIGHT_ENHANCEMENT_BRIGHTNESS_OFFSET", 8),
+                                       "denoise": app.config.get("NIGHT_ENHANCEMENT_DENOISE", False),
+                                   },
+                                   movement_min_observations=app.config.get("MOVEMENT_MIN_OBSERVATIONS", 2),
+                                   movement_confidence_threshold=app.config.get("MOVEMENT_KEYPOINT_CONFIDENCE", 0.3),
+                                   movement_max_gap_seconds=app.config.get("MOVEMENT_MAX_OBSERVATION_GAP_SECONDS", 2.5),
+                                   movement_max_measurements=app.config.get("MOTION_ANALYTICS_MAX_OBSERVATIONS", 2000),
+                                   motion_overlay_mode=str(saved_video.get("motion_overlay_mode") or
+                                                           app.config.get("MOTION_OVERLAY_MODE", "skeleton_tracking")),
+                                   video_id=video_id,
+                                   motion_batch_callback=persist_motion_batch if detector else None,
+                                   motion_run_id=job_id if detector else None,
+                                   motion_batch_size=app.config.get("MOTION_ANALYTICS_BATCH_SIZE", 100))
             if result.get("annotated_output") and output_path:
                 compatibility_name = os.path.splitext(output_name)[0] + ".mp4"
                 compatibility_output_path = os.path.join(app.config["PROCESSED_DIR"], compatibility_name)
@@ -519,6 +565,15 @@ def _run_analysis(app, video_id, job_id, path):
                 "object_analysis": object_result,
                 "zone_analysis": zone_result,
                 "analysis_settings": {"sample_every_seconds": result.get("sample_interval_seconds", app.config["SAMPLE_EVERY_SECONDS"]),
+                                      "lighting_requested_mode": requested_lighting_mode.upper(),
+                                      "lighting_sample_frames": app.config.get("LIGHTING_SAMPLE_FRAMES", 7),
+                                      "lighting_brightness_threshold": app.config.get("LIGHTING_BRIGHTNESS_THRESHOLD", 70),
+                                      "lighting_low_frame_fraction": app.config.get("LIGHTING_LOW_FRAME_FRACTION", 0.6),
+                                      "night_enhancement_config": result.get("night_enhancement_config", {}),
+                                      "movement_min_observations": app.config.get("MOVEMENT_MIN_OBSERVATIONS", 2),
+                                      "movement_keypoint_confidence": app.config.get("MOVEMENT_KEYPOINT_CONFIDENCE", 0.3),
+                                      "movement_max_observation_gap_seconds": app.config.get("MOVEMENT_MAX_OBSERVATION_GAP_SECONDS", 2.5),
+                                      "motion_overlay_mode": saved_video.get("motion_overlay_mode", app.config.get("MOTION_OVERLAY_MODE", "skeleton_tracking")),
                                       "zone_track_sample_seconds": app.config.get("ZONE_TRACK_SAMPLE_SECONDS", 0.5),
                                       "zone_entry_confirmation_frames": app.config.get("ZONE_ENTRY_CONFIRMATION_FRAMES", 2),
                                       "zone_exit_confirmation_frames": app.config.get("ZONE_EXIT_CONFIRMATION_FRAMES", 2),
@@ -537,6 +592,14 @@ def _run_analysis(app, video_id, job_id, path):
                                       "fight_window_stride": app.config.get("FIGHT_WINDOW_STRIDE", 1.0),
                                       "fight_confirmation_windows": app.config.get("FIGHT_CONFIRMATION_WINDOWS", 2)},
                 "fight_analysis": fight_result,
+                "lighting_mode": (result.get("lighting") or {}).get("lighting_mode", "DAY"),
+                "lighting_analysis": result.get("lighting") or {"status": "unavailable"},
+                "average_brightness": (result.get("lighting") or {}).get("average_brightness"),
+                "night_enhancement_applied": bool(result.get("night_enhancement_applied")),
+                "night_enhancement_config": result.get("night_enhancement_config", {}),
+                "movement_analysis": result.get("movement_analysis") or {"status": "unavailable", "observations": []},
+                "movement_observations": result.get("movement_observations", []),
+                "motion_analytics": result.get("motion_analytics") or {"status": "unavailable", "measurements": []},
                 "analysis_summary": build_analysis_summary(result, result.get("sample_interval_seconds", app.config["SAMPLE_EVERY_SECONDS"])),
                 "analysis_stage_timings": result_profile,
                 "processed_filename": output_name if result.get("annotated_output") else None,
@@ -678,6 +741,20 @@ def results(video_id):
     video["fight_analysis"] = video.get("fight_analysis") or {
         "status": "not_configured", "candidate_event_count": 0,
         "error_message": "No temporal fighting model was configured for this run."}
+    video["lighting_analysis"] = video.get("lighting_analysis") or {
+        "status": "not_recorded", "lighting_mode": video.get("lighting_mode", "Not recorded"),
+        "warnings": []}
+    video["movement_analysis"] = video.get("movement_analysis") or {
+        "status": "not_recorded", "observation_count": 0, "tracked_person_count": 0,
+        "observations": []}
+    video["movement_observations"] = video.get("movement_observations") or []
+    video["low_visibility_warnings"] = video["lighting_analysis"].get("warnings") or []
+    for movement in video["movement_observations"]:
+        try:
+            seconds = float(movement.get("start_timestamp_seconds"))
+            movement["time_label"] = format_video_timestamp(seconds) if math.isfinite(seconds) and seconds >= 0 else "Time unavailable"
+        except (TypeError, ValueError, OverflowError):
+            movement["time_label"] = "Time unavailable"
     video["zones"] = video.get("zones") or []
     video["zone_analysis"] = video.get("zone_analysis") or {
         "status": "not_configured", "zone_count": len(video["zones"]),
@@ -760,6 +837,9 @@ def results(video_id):
     event_types = sorted({event.get("event_type", "unknown") for event in events})
     event_labels = sorted({event["label"] for event in events if event.get("label")})
     event_tracks = sorted({str(event["track_id"]) for event in events if event.get("track_id") is not None})
+    video.setdefault("motion_analytics", {"status": "not_recorded", "measurement_count": 0,
+        "sampling_basis": "No saved pose measurements.",
+        "coordinate_note": "2D image-plane estimates; no physical calibration."})
     return render_template("results.html", video=video, events=events, face_frames=face_frames,
                            pose_frames=pose_frames,
                            event_types=event_types, event_labels=event_labels, event_tracks=event_tracks,
@@ -852,6 +932,166 @@ def video_report_pdf(video_id):
     content = build_pdf(video, job, events)
     return Response(content, mimetype="application/pdf",
                     headers={"Content-Disposition": f"attachment; filename=analysis-{video_id[:8]}.pdf"})
+
+
+def _motion_filter_values():
+    person = request.args.get("person", "").strip()
+    joint = request.args.get("joint", "").strip()
+    start_text, end_text = request.args.get("start", "").strip(), request.args.get("end", "").strip()
+    try:
+        person_id = int(person) if person else None
+        start = float(start_text) if start_text else None
+        end = float(end_text) if end_text else None
+    except (TypeError, ValueError, OverflowError):
+        abort(400)
+    if (start is not None and (not math.isfinite(start) or start < 0) or
+            end is not None and (not math.isfinite(end) or end < 0) or
+            start is not None and end is not None and start > end):
+        abort(400)
+    allowed_joints = {"left_elbow", "right_elbow", "left_shoulder", "right_shoulder",
+        "left_knee", "right_knee", "left_hip", "right_hip", "torso_inclination",
+        "shoulder_line", "hip_line", "left_upper_arm", "right_upper_arm", "left_forearm",
+        "right_forearm", "left_thigh", "right_thigh", "left_lower_leg", "right_lower_leg"}
+    if joint and joint not in allowed_joints:
+        abort(400)
+    return person_id, joint, start, end
+
+
+def _filtered_motion_measurements(video):
+    analytics = video.get("motion_analytics") or {}
+    if not isinstance(analytics, dict):
+        analytics = {}
+    values = analytics.get("measurements") or []
+    if not isinstance(values, list):
+        values = []
+    person_id, joint, start, end = _motion_filter_values()
+    filtered = []
+    for row in values:
+        if not isinstance(row, dict):
+            continue
+        if person_id is not None and row.get("track_id") != person_id:
+            continue
+        timestamp = row.get("timestamp_seconds")
+        if not isinstance(timestamp, (int, float)) or not math.isfinite(float(timestamp)):
+            continue
+        if start is not None and timestamp < start or end is not None and timestamp > end:
+            continue
+        joints = row.get("joint_measurements") or {}
+        if not isinstance(joints, dict):
+            continue
+        if joint and joint not in joints:
+            continue
+        filtered.append(row)
+    return filtered, joint
+
+
+@bp.get("/api/videos/<video_id>/motion-analytics")
+def motion_analytics_data(video_id):
+    video = get_video(video_id)
+    if not video:
+        abort(404)
+    analytics = video.get("motion_analytics") or {}
+    person_id, selected_joint, start, end = _motion_filter_values()
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+        limit = max(1, min(200, int(request.args.get("limit", "100"))))
+        graph_limit = max(1, min(1000, int(request.args.get("graph_limit", "500"))))
+    except (TypeError, ValueError):
+        abort(400)
+    if analytics.get("storage") == "frame_collection" and analytics.get("analysis_run_id"):
+        run_id = str(analytics["analysis_run_id"])
+        total = count_motion_measurements(video_id, run_id, person_id, selected_joint, start, end)
+        summary = summarize_motion_measurements(video_id, run_id, person_id, selected_joint,
+                                                start, end, graph_limit)
+        page_count = max(1, math.ceil(total / limit))
+        page = min(page, page_count)
+        offset = (page - 1) * limit
+        page_rows = get_motion_measurements(video_id, run_id, person_id, selected_joint,
+                                           start, end, offset, limit)
+        people = sorted(summary["people"])
+        angular_max = summary["maximum_angular_velocity"]
+        average_speed = summary["average_speed"]
+        joint_count = summary["joint_count"]
+        graph_rows = summary["graph_rows"]
+    else:
+        measurements, selected_joint = _filtered_motion_measurements(video)
+        total = len(measurements)
+        page_count = max(1, math.ceil(total / limit))
+        page = min(page, page_count)
+        offset = (page - 1) * limit
+        angular_velocities = [abs(value.get("angular_velocity_degrees_per_second"))
+                              for row in measurements for value in (row.get("joint_measurements") or {}).values()
+                              if isinstance(value, dict)
+                              and isinstance(value.get("angular_velocity_degrees_per_second"), (int, float))]
+        speeds = [row.get("movement_speed_pixels_per_second") for row in measurements
+                  if isinstance(row.get("movement_speed_pixels_per_second"), (int, float))]
+        joint_count = sum(len(row.get("joint_measurements") or {}) for row in measurements)
+        people = sorted({row.get("track_id") for row in measurements
+                         if isinstance(row.get("track_id"), int) and not isinstance(row.get("track_id"), bool)})
+        if len(measurements) > graph_limit:
+            indexes = [round(index * (len(measurements) - 1) / (graph_limit - 1))
+                       for index in range(graph_limit)] if graph_limit > 1 else [0]
+            graph_rows = [measurements[index] for index in indexes]
+        else:
+            graph_rows = measurements
+        page_rows = measurements[offset:offset + limit]
+        angular_max = round(max(angular_velocities), 3) if angular_velocities else None
+        average_speed = round(sum(speeds) / len(speeds), 3) if speeds else None
+    return jsonify({
+        "status": analytics.get("status", "not_recorded"),
+        "sampling_basis": analytics.get("sampling_basis", "No saved pose measurements."),
+        "coordinate_note": analytics.get("coordinate_note", "2D image-plane estimates; no physical calibration."),
+        "measurement_count": total,
+        "joint_measurement_count": joint_count,
+        "dropped_measurement_count": analytics.get("dropped_measurement_count", 0),
+        "people": people, "selected_joint": selected_joint,
+        "average_speed_pixels_per_second": round(average_speed, 3) if average_speed is not None else None,
+        "maximum_angular_velocity_degrees_per_second": round(angular_max, 3) if angular_max is not None else None,
+        "page": page, "page_count": page_count, "limit": limit,
+        "rows": page_rows, "graph_rows": graph_rows,
+    })
+
+
+@bp.get("/results/<video_id>/motion-analytics.csv")
+def motion_analytics_download(video_id):
+    video = get_video(video_id)
+    if not video:
+        abort(404)
+    analytics = video.get("motion_analytics") or {}
+    if analytics.get("storage") == "frame_collection" and analytics.get("analysis_run_id"):
+        person_id, joint, start, end = _motion_filter_values()
+        run_id = str(analytics["analysis_run_id"])
+
+        @stream_with_context
+        def export_rows():
+            offset, page_size, header_sent = 0, 500, False
+            while True:
+                rows = get_motion_measurements(video_id, run_id, person_id, joint,
+                                               start, end, offset, page_size)
+                if not rows:
+                    if not header_sent:
+                        yield motion_analytics_csv(video_id, [])
+                    break
+                chunk = motion_analytics_csv(video_id, rows)
+                lines = chunk.splitlines(keepends=True)
+                if not header_sent:
+                    yield lines[0]
+                    header_sent = True
+                yield from lines[1:]
+                offset += len(rows)
+                if len(rows) < page_size:
+                    break
+
+        return Response(export_rows(), mimetype="text/csv", headers={
+            "Content-Disposition": f"attachment; filename=motion-{video_id[:8]}.csv"})
+    measurements, selected_joint = _filtered_motion_measurements(video)
+    if selected_joint:
+        measurements = [{**row, "joint_measurements": {selected_joint: row["joint_measurements"][selected_joint]}}
+                        for row in measurements if selected_joint in (row.get("joint_measurements") or {})]
+    # Stored measurements are bounded per video; the export never runs inference.
+    content = motion_analytics_csv(video_id, measurements)
+    return Response(content, mimetype="text/csv", headers={
+        "Content-Disposition": f"attachment; filename=motion-{video_id[:8]}.csv"})
 
 
 @bp.get("/api/videos/<video_id>/status")

@@ -20,6 +20,9 @@
   const undoButton = document.getElementById('zone-undo');
   const clearButton = document.getElementById('zone-clear');
   const list = document.getElementById('zone-list');
+  const lightingPreview = document.getElementById('lighting-preview-status');
+  const lightingMode = document.getElementById('lighting-mode');
+  const lightingConfig = document.querySelector('.lighting-config');
 
   let sourceFrame = null;
   let sampleCanvas = null;
@@ -170,7 +173,26 @@
     for (let index = 0; index < pixels.length; index += 4) {
       total += (pixels[index] * 0.2126 + pixels[index + 1] * 0.7152 + pixels[index + 2] * 0.0722);
     }
-    return total / (pixels.length / 4) < 8;
+    return total / (pixels.length / 4);
+  }
+
+  function updateLightingPreview() {
+    if (!lightingPreview) return;
+    const mode = lightingMode?.value || 'auto';
+    if (!frameReady || !video.videoWidth) {
+      lightingPreview.textContent = mode === 'auto'
+        ? 'Lighting will be assessed from multiple video frames after upload.'
+        : `Manual ${mode === 'day' ? 'Day' : 'Night Vision'} Mode will be applied during analysis.`;
+      return;
+    }
+    const threshold = Number(lightingConfig?.dataset.threshold || 70);
+    const luminance = looksLikeBlackFrame();
+    const brightness = Number.isFinite(luminance) ? `${luminance.toFixed(1)} / 255` : 'unavailable';
+    if (mode === 'auto') {
+      lightingPreview.textContent = `Selected-frame luminance: ${brightness}. ${luminance < threshold ? 'This frame appears dim; the worker checks multiple frames before enabling enhancement.' : 'This frame is bright; other sampled frames are also checked.'}`;
+    } else {
+      lightingPreview.textContent = `Selected-frame luminance: ${brightness}. Manual ${mode === 'day' ? 'Day' : 'Night Vision'} Mode will override automatic classification.`;
+    }
   }
 
   function captureFrame(token = loadToken) {
@@ -191,7 +213,9 @@
       frameSlider.value = Number.isFinite(video.currentTime) ? video.currentTime : 0;
       frameTime.value = formatClock(Number(frameSlider.value));
       resizeCanvas();
-      if (looksLikeBlackFrame()) {
+      const previewBrightness = looksLikeBlackFrame();
+      updateLightingPreview();
+      if (previewBrightness < 8) {
         setFrameStatus('This decoded frame is very dark. Use the frame slider to choose a clearer moment.', 'ready');
       } else {
         setFrameStatus(`Video frame ready - ${canvas.width} x ${canvas.height}`, 'ready');
@@ -275,6 +299,8 @@
       captureFrame(token);
     }
   });
+
+  lightingMode?.addEventListener('change', updateLightingPreview);
 
   frameSlider.addEventListener('input', () => {
     const seconds = Number(frameSlider.value);

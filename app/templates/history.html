@@ -55,6 +55,16 @@
 
 {% macro analysis_details(v) %}
 <div class="history-analysis-grid">
+  <section class="history-analysis-card"><h3>Lighting &amp; Movement</h3>
+    <p>Lighting mode: <b>{{ v.lighting_mode_display }}</b></p>
+    <p>Automatic assessment: <b>{{ v.detected_lighting_mode_display }}</b></p>
+    <p>Night enhancement: <b>{{ v.night_enhancement_display }}</b></p>
+    {% if v.get('average_brightness') is not none %}<p>Average grayscale brightness: <b>{{ '%.1f'|format(v.average_brightness|float) }} / 255</b></p>{% endif %}
+    <p>Movement analysis: <b>{{ (v.movement_analysis or {}).get('status','not recorded')|replace('_',' ')|title }}</b> &middot; {{ v.movement_observation_count }} observations</p>
+    <p>Motion analytics: <b>{{ (v.motion_analytics or {}).get('status','not recorded')|replace('_',' ')|title }}</b> &middot; {{ (v.motion_analytics or {}).get('measurement_count',0) }} sampled person measurements</p>
+    <small>Movement observations are separate from anomaly-event counts and use temporary per-video tracks.</small>
+    {% for warning in v.lighting_analysis.get('warnings', []) %}<small class="history-warning">{{ warning }}</small>{% endfor %}
+  </section>
   <section class="history-analysis-card"><h3>Video and Processing Details</h3>
     <p>Original filename: <b>{{ v.original_name or 'Filename unavailable' }}</b></p>
     <p>Uploaded (IST): <b>{{ v.uploaded_at }}</b></p>

@@ -11,7 +11,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from pymongo import DESCENDING
 from pymongo import ReturnDocument
-from pymongo.errors import ConfigurationError, ConnectionFailure, PyMongoError
+from pymongo.errors import BulkWriteError, ConfigurationError, ConnectionFailure, DuplicateKeyError, PyMongoError
 from flask import current_app
 from app.db import DatabaseUnavailable, _friendly_connection_error, get_database
 from app.services.timestamps import event_video_seconds, utc_datetime_sort_key
@@ -708,6 +708,165 @@ def save_pose_frames(video_id, frames):
     now = datetime.now(timezone.utc)
     documents = [{**frame, "video_id": oid, "created_at": now} for frame in frames]
     return _run(lambda db: len(db.pose_detection_frames.insert_many(documents).inserted_ids))
+
+
+def save_motion_measurements(video_id, run_id, measurements):
+    """Persist exact per-person/per-frame rows outside the growing video document.
+
+    Retries are idempotent by run, source frame, temporary track and segment.
+    Local-only uploads use an append-only JSONL sidecar beside the normal
+    fallback file; MongoDB uses an additive collection and indexes.
+    """
+    oid, run_oid = object_id(video_id), object_id(run_id)
+    if oid is None or run_oid is None or not measurements:
+        return 0
+    from app.services.local_fallback import get_pending_video, save_pending_motion_measurements
+    local = get_pending_video(video_id)
+    if local and local.get("local_only"):
+        return save_pending_motion_measurements(video_id, run_id, measurements) or 0
+    now = datetime.now(timezone.utc)
+    operations = []
+    for row in measurements:
+        if not isinstance(row, dict) or row.get("frame_number") is None or row.get("track_id") is None:
+            continue
+        key = {"video_id": oid, "analysis_run_id": run_oid,
+               "frame_number": int(row["frame_number"]), "track_id": int(row["track_id"]),
+               "track_segment_id": str(row.get("track_segment_id") or "")}
+        stable_key = "|".join((str(oid), str(run_oid), str(key["frame_number"]),
+                               str(key["track_id"]), key["track_segment_id"]))
+        stable_id = ObjectId(hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:24])
+        document = {"_id": stable_id, **row, **key, "created_at": now}
+        operations.append(document)
+    if not operations:
+        return 0
+    ids = [document["_id"] for document in operations]
+    def insert(db):
+        try:
+            result = db.motion_analytics_frames.insert_many(operations, ordered=False)
+            return len(result.inserted_ids)
+        except (BulkWriteError, DuplicateKeyError):
+            # A retried batch may already be accepted. Confirm every stable row
+            # exists before treating that duplicate as an idempotent success.
+            confirmed = db.motion_analytics_frames.count_documents({"_id": {"$in": ids}})
+            if confirmed == len(ids):
+                return confirmed
+            raise
+    return _run(insert)
+
+
+def _motion_query(video_id, run_id, person=None, joint=None, start=None, end=None):
+    oid, run_oid = object_id(video_id), object_id(run_id)
+    if oid is None or run_oid is None:
+        return None
+    query = {"video_id": oid, "analysis_run_id": run_oid}
+    if person is not None:
+        query["track_id"] = int(person)
+    if joint:
+        query[f"joint_measurements.{joint}"] = {"$exists": True}
+    if start is not None or end is not None:
+        bounds = {}
+        if start is not None:
+            bounds["$gte"] = float(start)
+        if end is not None:
+            bounds["$lte"] = float(end)
+        query["timestamp_seconds"] = bounds
+    return query
+
+
+def _iter_local_motion_measurements(video_id, run_id, person=None, joint=None, start=None, end=None):
+    from app.services.local_fallback import iter_pending_motion_measurements
+    for row in iter_pending_motion_measurements(video_id, run_id):
+        timestamp = row.get("timestamp_seconds")
+        if person is not None and row.get("track_id") != int(person):
+            continue
+        if not isinstance(timestamp, (int, float)):
+            continue
+        if start is not None and timestamp < float(start) or end is not None and timestamp > float(end):
+            continue
+        joints = row.get("joint_measurements") or {}
+        if joint and joint not in joints:
+            continue
+        yield row
+
+
+def get_motion_measurements(video_id, run_id, person=None, joint=None, start=None, end=None,
+                            skip=0, limit=200):
+    query = _motion_query(video_id, run_id, person, joint, start, end)
+    if query is None:
+        return []
+    from app.services.local_fallback import get_pending_video
+    local = get_pending_video(video_id)
+    if local and local.get("local_only"):
+        rows = []
+        wanted_skip, cap = max(0, int(skip)), max(1, min(500, int(limit)))
+        for row in _iter_local_motion_measurements(video_id, run_id, person, joint, start, end):
+            if wanted_skip:
+                wanted_skip -= 1
+                continue
+            rows.append(row)
+            if len(rows) >= cap:
+                break
+        return rows
+    projection = {"_id": 0, "video_id": 0, "analysis_run_id": 0, "created_at": 0}
+    return _run(lambda db: list(db.motion_analytics_frames.find(query, projection)
+        .sort([("timestamp_seconds", 1), ("frame_number", 1), ("track_id", 1)])
+        .skip(max(0, int(skip))).limit(max(1, min(500, int(limit))))))
+
+
+def count_motion_measurements(video_id, run_id, person=None, joint=None, start=None, end=None):
+    query = _motion_query(video_id, run_id, person, joint, start, end)
+    if query is None:
+        return 0
+    from app.services.local_fallback import get_pending_video
+    local = get_pending_video(video_id)
+    if local and local.get("local_only"):
+        return sum(1 for _row in _iter_local_motion_measurements(video_id, run_id, person, joint, start, end))
+    return _run(lambda db: db.motion_analytics_frames.count_documents(query))
+
+
+def summarize_motion_measurements(video_id, run_id, person=None, joint=None, start=None, end=None,
+                                  graph_limit=500):
+    """Stream rows to calculate bounded chart summaries and filter options."""
+    query = _motion_query(video_id, run_id, person, joint, start, end)
+    result = {"count": 0, "joint_count": 0, "people": set(), "average_speed": None,
+              "maximum_angular_velocity": None, "graph_rows": []}
+    if query is None:
+        return result
+    from app.services.local_fallback import get_pending_video
+    local = get_pending_video(video_id)
+    if local and local.get("local_only"):
+        source = _iter_local_motion_measurements(video_id, run_id, person, joint, start, end)
+    else:
+        source = _run(lambda db: db.motion_analytics_frames.find(
+            query, {"_id": 0, "video_id": 0, "analysis_run_id": 0, "created_at": 0})
+            .sort([("timestamp_seconds", 1), ("frame_number", 1), ("track_id", 1)]))
+    speeds = 0.0
+    speed_count = 0
+    max_angular = None
+    limit = max(1, min(1000, int(graph_limit)))
+    stride = 1
+    for row in source:
+        index = result["count"]
+        result["count"] += 1
+        result["joint_count"] += len(row.get("joint_measurements") or {})
+        if isinstance(row.get("track_id"), int):
+            result["people"].add(row["track_id"])
+        speed = row.get("movement_speed_pixels_per_second")
+        if isinstance(speed, (int, float)):
+            speeds += float(speed)
+            speed_count += 1
+        for value in (row.get("joint_measurements") or {}).values():
+            angular = value.get("angular_velocity_degrees_per_second") if isinstance(value, dict) else None
+            if isinstance(angular, (int, float)):
+                max_angular = max(max_angular or 0, abs(float(angular)))
+        if index % stride == 0:
+            result["graph_rows"].append(row)
+            if len(result["graph_rows"]) > limit:
+                result["graph_rows"] = result["graph_rows"][::2]
+                stride *= 2
+    result["average_speed"] = speeds / speed_count if speed_count else None
+    result["maximum_angular_velocity"] = max_angular
+    return result
 
 
 def queue_video_retry(video_id):

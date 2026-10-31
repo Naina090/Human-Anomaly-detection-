@@ -3,17 +3,169 @@ import logging
 import math
 import os
 import uuid
+import inspect
 from collections import Counter, defaultdict
 import cv2
 import numpy as np
 from flask import current_app, has_app_context
 from app.logging_utils import sanitized_traceback
 from app.services.timestamps import format_video_timestamp
+from app.services.lighting import assess_capture, enhance_low_light_frame
+from app.services.movement_analysis import MovementAnalyzer
 
 log = logging.getLogger(__name__)
 
 class VideoError(Exception):
     pass
+
+
+class MotionPersistenceError(RuntimeError):
+    """Fail the analysis rather than silently dropping a frame-level batch."""
+
+
+_OVERLAY_ANGLE_LABELS = (
+    ("left_elbow", "LE", "left_elbow"),
+    ("right_elbow", "RE", "right_elbow"),
+    ("left_shoulder", "LS", "left_shoulder"),
+    ("right_shoulder", "RS", "right_shoulder"),
+    ("left_knee", "LK", "left_knee"),
+    ("right_knee", "RK", "right_knee"),
+    ("left_hip", "LH", "left_hip"),
+    ("right_hip", "RH", "right_hip"),
+)
+
+
+def _draw_motion_overlay(frame, people, metrics, movement_labels, timestamp, lighting_mode):
+    """Draw only current-frame pose measurements onto their matching frame.
+
+    Joint labels show the saved three-observation smoothed angle. No label is
+    drawn unless that exact frame produced a valid measurement and the relevant
+    keypoint is present. Speed and direction are image-plane units only.
+    """
+    output = frame
+    height, width = output.shape[:2]
+    metric_by_track = {row.get("track_id"): row for row in (metrics or [])
+                       if row.get("track_id") is not None}
+
+    mode = str(lighting_mode or "UNKNOWN").replace("_", " ").upper()
+    stamp = format_video_timestamp(timestamp) or "time unavailable"
+    header = f"{mode}  |  {stamp}  |  angle deg / speed px/s"
+    (text_width, text_height), _ = cv2.getTextSize(header, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+    x, y = 8, 8
+    cv2.rectangle(output, (x, y), (min(width - 1, x + text_width + 14), y + text_height + 12),
+                  (12, 25, 38), -1)
+    cv2.putText(output, header, (x + 6, y + text_height + 5), cv2.FONT_HERSHEY_SIMPLEX,
+                0.42, (100, 225, 238), 1, cv2.LINE_AA)
+
+    angle_count = 0
+    movement_count = 0
+    for person in people or []:
+        track_id = person.get("track_id")
+        if track_id is None:
+            continue
+        metric = metric_by_track.get(track_id)
+        if metric is None:
+            continue
+        keypoints = person.get("keypoints") or {}
+        joints = metric.get("joint_measurements") or {}
+        for name, short_name, center_name in _OVERLAY_ANGLE_LABELS:
+            measurement = joints.get(name)
+            point = keypoints.get(center_name)
+            if not measurement or not measurement.get("valid") or not isinstance(point, dict):
+                continue
+            try:
+                angle = float(measurement["smoothed_angle_degrees"])
+                px, py = int(round(float(point["x"]))), int(round(float(point["y"])))
+                confidence = float(point["confidence"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if not (math.isfinite(angle) and math.isfinite(confidence) and confidence >= 0.3
+                    and 0 <= px < width and 0 <= py < height):
+                continue
+            label = f"{short_name}{angle:.0f}"
+            (label_width, label_height), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
+            # Put left-side and right-side labels on their anatomical side;
+            # compact integer degrees reduce overlap in crowded scenes.
+            prefer_left = center_name.startswith("left_")
+            if prefer_left and px - label_width - 10 >= 0:
+                lx = px - label_width - 9
+            elif not prefer_left and px + label_width + 10 < width:
+                lx = px + 7
+            else:
+                lx = px + 7 if px + label_width + 10 < width else max(0, px - label_width - 9)
+            ly = py + label_height + 7 if "hip" in center_name else py - 5
+            if ly - label_height - baseline - 3 < 0:
+                ly = min(height - 2, py + label_height + 7)
+            cv2.rectangle(output, (lx, max(0, ly - label_height - baseline - 3)),
+                          (min(width - 1, lx + label_width + 5), min(height - 1, ly + 2)),
+                          (12, 25, 38), -1)
+            cv2.putText(output, label, (lx + 3, ly), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.32, (117, 245, 177), 1, cv2.LINE_AA)
+            angle_count += 1
+
+        torso = joints.get("torso_inclination")
+        if torso and torso.get("valid"):
+            shoulder_points = [keypoints.get("left_shoulder"), keypoints.get("right_shoulder")]
+            hip_points = [keypoints.get("left_hip"), keypoints.get("right_hip")]
+            try:
+                shoulders = [point for point in shoulder_points
+                             if point and float(point["confidence"]) >= 0.3]
+                hips = [point for point in hip_points
+                        if point and float(point["confidence"]) >= 0.3]
+                angle = float(torso["smoothed_angle_degrees"])
+                if shoulders and hips and math.isfinite(angle):
+                    sx = sum(float(point["x"]) for point in shoulders) / len(shoulders)
+                    sy = sum(float(point["y"]) for point in shoulders) / len(shoulders)
+                    hx = sum(float(point["x"]) for point in hips) / len(hips)
+                    hy = sum(float(point["y"]) for point in hips) / len(hips)
+                    tx, ty = int(round((sx + hx) / 2)), int(round((sy + hy) / 2))
+                    if 0 <= tx < width and 0 <= ty < height:
+                        cv2.putText(output, f"T{angle:.0f}", (min(width - 28, tx + 5), min(height - 3, ty)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (117, 245, 177), 1, cv2.LINE_AA)
+                        angle_count += 1
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+
+        box = person.get("bbox_xyxy")
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        try:
+            x1, y1, x2, _y2 = (int(round(float(value))) for value in box)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        line_parts = [f"ID {track_id}"]
+        speed = metric.get("movement_speed_pixels_per_second")
+        direction = metric.get("movement_direction_degrees")
+        if speed is not None:
+            line_parts.append(f"{float(speed):.0f}px/s")
+        if direction is not None:
+            line_parts.append(f"{float(direction):.0f}deg")
+        observation = (movement_labels or {}).get(track_id)
+        if observation and observation not in {"movement_observed", "insufficient_temporal_evidence"}:
+            line_parts.append(str(observation).replace("_", " ")[:16])
+        lines = [" | ".join(line_parts)]
+        font_scale, line_gap = 0.36, 16
+        panel_width = min(width - 8, cv2.getTextSize(lines[0], cv2.FONT_HERSHEY_SIMPLEX,
+                            font_scale, 1)[0][0] + 12)
+        panel_height = line_gap + 6
+        panel_x = max(4, min(width - panel_width - 4, x1))
+        try:
+            y2 = int(round(float(box[3])))
+        except (TypeError, ValueError, OverflowError):
+            y2 = y1
+        panel_y = y2 + 3
+        if panel_y + panel_height >= height:
+            panel_y = max(24, y1 - panel_height - 3)
+        panel_y = min(max(4, height - panel_height - 4), panel_y)
+        cv2.rectangle(output, (panel_x, panel_y),
+                      (panel_x + panel_width, panel_y + panel_height), (12, 25, 38), -1)
+        for index, line in enumerate(lines):
+            cv2.putText(output, line, (panel_x + 6, panel_y + 15 + index * line_gap),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                        (100, 225, 238) if index == 0 else (220, 235, 242), 1, cv2.LINE_AA)
+        movement_count += 1
+    return output, angle_count, movement_count
 
 
 def _zone_transition_events(pose_frames, zones, width, height, entry_confirmation_frames=2,
@@ -464,7 +616,14 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
                  face_detector=None, object_detector=None, zones=None,
                  zone_sample_seconds=0.5, zone_entry_confirmation_frames=2,
                  zone_exit_confirmation_frames=2, zone_track_max_gap_seconds=1.5,
-                 zone_boundary_margin_px=8.0, fight_detector=None, output_max_width=640):
+                 zone_boundary_margin_px=8.0, fight_detector=None, output_max_width=640,
+                 requested_lighting_mode="auto", lighting_sample_frames=7,
+                 lighting_brightness_threshold=70.0, lighting_low_frame_fraction=0.6,
+                 night_enhancement_config=None, movement_min_observations=2,
+                 movement_confidence_threshold=0.3, movement_max_gap_seconds=2.5,
+                 movement_max_measurements=2000, motion_overlay_mode="skeleton_tracking",
+                 video_id=None, motion_batch_callback=None, motion_run_id=None,
+                 motion_batch_size=100):
     start = time.monotonic()
     profile = defaultdict(float)
     capture = cv2.VideoCapture(path)
@@ -481,6 +640,33 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
     if duration > max_duration:
         capture.release()
         raise VideoError(f"Video is {duration:.0f}s; maximum allowed is {max_duration}s.")
+    lighting_started = time.perf_counter()
+    try:
+        lighting = assess_capture(capture, frame_count, lighting_sample_frames,
+                                  lighting_brightness_threshold, lighting_low_frame_fraction,
+                                  requested_lighting_mode)
+    except (ValueError, cv2.error, TypeError) as exc:
+        mode = str(requested_lighting_mode or "auto").lower()
+        lighting = {"status": "unavailable", "requested_mode": mode.upper(),
+                    "detected_mode": "UNKNOWN",
+                    "lighting_mode": "NIGHT_VISION" if mode == "night_vision" else "DAY",
+                    "night_enhancement_applied": mode == "night_vision",
+                    "average_brightness": None, "median_brightness": None,
+                    "average_contrast": None, "sampled_frame_count": 0,
+                    "warnings": ["Lighting assessment could not sample representative frames; automatic mode was not inferred."]}
+        if mode not in {"auto", "day", "night_vision"}:
+            raise
+    lighting["status"] = "complete" if lighting.get("sampled_frame_count", 0) else "unavailable"
+    profile["lighting_assessment_seconds"] += time.perf_counter() - lighting_started
+    enhancement_config = dict(night_enhancement_config or {})
+    movement_analyzer = MovementAnalyzer(movement_min_observations, movement_confidence_threshold,
+                                         movement_max_gap_seconds, movement_max_measurements,
+                                         retain_motion_measurements=motion_batch_callback is None)
+    motion_pending = []
+    motion_batch_size = max(1, min(1000, int(motion_batch_size or 100)))
+    movement_track_ids = set()
+    movement_error = None
+    enhancement_failure_recorded = False
     # Read at a bounded interval without retaining a complete video in memory.
     active_zones = [zone for zone in (zones or []) if zone.get("enabled") is True]
     try:
@@ -493,8 +679,20 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
     events = []
     pose_frames = []
     pose_error = None
+    motion_error = None
     pose_frames_sampled = 0
     pose_frames_with_people = 0
+    pose_all_frames_with_people = 0
+    pose_attempted_frames = 0
+    pose_processed_frames = 0
+    pose_failed_frames = 0
+    motion_geometry_failed_frames = 0
+    pose_frames_without_people = 0
+    pose_person_observations = 0
+    motion_overlay_frames = 0
+    motion_overlay_angle_labels = 0
+    motion_overlay_person_panels = 0
+    decoded_frames = 0
     face_frames = []
     face_error = None
     object_error = None
@@ -511,6 +709,14 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
     annotated_output_error = None
     annotated_output_metadata = None
     temporary_output_path = None
+    pose_accepts_transition_flag = False
+    if detector is not None:
+        try:
+            signature = inspect.signature(detector.inspect_with_evidence)
+            pose_accepts_transition_flag = ("update_transition" in signature.parameters or
+                any(item.kind == inspect.Parameter.VAR_KEYWORD for item in signature.parameters.values()))
+        except (AttributeError, TypeError, ValueError):
+            pass
     try:
         output_max_width = max(0, int(output_max_width or 0))
     except (TypeError, ValueError):
@@ -518,8 +724,12 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
     output_scale = (output_max_width / width if output_max_width and width > output_max_width else 1.0)
     output_width = max(2, int(round(width * output_scale / 2) * 2))
     output_height = max(2, int(round(height * output_scale / 2) * 2))
+    # Assess lighting before deciding whether to encode. A low-light run should
+    # still produce its enhanced evidence video when optional detectors are
+    # unavailable; a daylight validation-only run keeps the historical no-output
+    # behavior when no visual analysis stage is enabled.
     if (detector is not None or face_detector is not None or object_detector is not None or
-            fight_detector is not None or zones) and output_path:
+            fight_detector is not None or zones or lighting.get("night_enhancement_applied")) and output_path:
         try:
             # VP8 belongs in WebM. Write to a unique temporary WebM and publish
             # only after final metadata and key-frame validation.
@@ -534,12 +744,14 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
             writer = None
             annotated_output_error = "OpenCV could not initialize the VP8/WebM encoder."
     try:
-        while frame_index < frame_count:
+        while True:
             stage_started = time.perf_counter()
             ok, frame = capture.read()
             profile["video_decode_seconds"] += time.perf_counter() - stage_started
             if not ok:
                 break
+            decoded_frames += 1
+            original_frame = frame
             # Prefer advancing OpenCV presentation timestamps (useful for
             # variable-frame-rate files); fall back to frame index / FPS when
             # the backend returns a stale, zero, or invalid value.
@@ -567,38 +779,135 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
                               type(exc).__name__, sanitized_traceback(exc, config))
                     fight_error = "Temporal fighting inference stopped after a model error. See server logs for the exception type."
                     fight_detector = None
+            if (lighting.get("night_enhancement_applied") and
+                    (detector is not None or writer is not None or frame_index % interval == 0)):
+                try:
+                    stage_started = time.perf_counter()
+                    frame = enhance_low_light_frame(
+                        original_frame,
+                        clip_limit=enhancement_config.get("clip_limit", 2.2),
+                        gamma=enhancement_config.get("gamma", 0.78),
+                        brightness_offset=enhancement_config.get("brightness_offset", 8),
+                        denoise=enhancement_config.get("denoise", False),
+                    )
+                    profile["night_enhancement_seconds"] += time.perf_counter() - stage_started
+                except (ValueError, cv2.error, TypeError) as exc:
+                    frame = original_frame
+                    lighting["night_enhancement_applied"] = False
+                    lighting["warnings"].append("Night enhancement failed; original frames were used for inference.")
+                    if not enhancement_failure_recorded:
+                        log.warning("Low-light enhancement unavailable (%s).", type(exc).__name__)
+                        enhancement_failure_recorded = True
+            if lighting.get("night_enhancement_applied"):
+                indicator = f"NIGHT VISION  |  {format_video_timestamp(timestamp) or 'time unavailable'}"
+                cv2.rectangle(frame, (8, max(0, height - 30)),
+                              (min(width - 1, 335), height - 6), (8, 20, 31), -1)
+                cv2.putText(frame, indicator, (14, height - 13), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, (105, 225, 238), 1, cv2.LINE_AA)
+            source_frame = frame
+            current_pose_evidence = None
+            current_pose_event = None
+            # Motion analytics uses every successfully decoded source frame.
+            # The legacy fall-transition state advances only at its previous
+            # sampled cadence; detections and ByteTrack still update each frame.
+            if detector is not None:
+                pose_attempted_frames += 1
+                sampled_for_legacy = frame_index % interval == 0
+                pose_returned = False
+                try:
+                    pose_started = time.perf_counter()
+                    if hasattr(detector, "inspect_with_evidence"):
+                        if pose_accepts_transition_flag:
+                            frame, current_pose_event, current_pose_evidence = detector.inspect_with_evidence(
+                                frame, timestamp, update_transition=sampled_for_legacy)
+                        else:
+                            frame, current_pose_event, current_pose_evidence = detector.inspect_with_evidence(frame, timestamp)
+                    else:
+                        frame, current_pose_event = detector.inspect(frame, timestamp)
+                        current_pose_evidence = {"timestamp_seconds": timestamp, "people": [], "person_count": 0}
+                    pose_elapsed = time.perf_counter() - pose_started
+                    profile["pose_and_tracking_seconds"] += pose_elapsed
+                    model_track_elapsed = float(getattr(detector, "last_model_track_seconds", 0.0) or 0.0)
+                    if model_track_elapsed:
+                        profile["pose_model_inference_and_tracker_seconds"] += model_track_elapsed
+                        profile["pose_evidence_extraction_and_overlay_seconds"] += max(
+                            0.0, pose_elapsed - model_track_elapsed)
+                    pose_returned = True
+                    pose_processed_frames += 1
+                    current_pose_evidence = dict(current_pose_evidence or {})
+                    current_pose_evidence["frame_number"] = int(frame_index)
+                    current_pose_evidence["source_fps"] = float(fps)
+                    current_pose_evidence["detection_method"] = getattr(detector, "METHOD", "pose estimator")
+                    current_pose_evidence["lighting_mode"] = lighting.get("lighting_mode")
+                    people = current_pose_evidence.get("people") or []
+                    pose_person_observations += len(people)
+                    if people:
+                        pose_all_frames_with_people += 1
+                    else:
+                        pose_frames_without_people += 1
+                    if sampled_for_legacy:
+                        if people:
+                            pose_frames_with_people += 1
+                    for person in people:
+                        if person.get("track_id") is not None:
+                            pose_track_ids.add(person["track_id"])
+                    movement_started = time.perf_counter()
+                    movement_labels = movement_analyzer.observe(
+                        people, width, height, timestamp, lighting.get("lighting_mode"),
+                        frame_number=frame_index, video_id=video_id)
+                    for metric in movement_analyzer.motion_history.last_batch:
+                        metric["source_fps"] = float(fps)
+                        metric["measurement_valid"] = bool(metric.get("joint_measurements"))
+                        metric["movement_observation"] = movement_labels.get(metric["track_id"])
+                    profile["movement_analysis_seconds"] += time.perf_counter() - movement_started
+                    # The pose service has already drawn the current frame's
+                    # COCO-17 skeleton and IDs. Add measurements from this same
+                    # frame only; no previous-frame pose is reused.
+                    stage_started = time.perf_counter()
+                    frame, angle_labels, person_panels = _draw_motion_overlay(
+                        frame, people, movement_analyzer.motion_history.last_batch,
+                        movement_labels, timestamp, lighting.get("lighting_mode"))
+                    profile["motion_overlay_seconds"] += time.perf_counter() - stage_started
+                    motion_overlay_frames += 1
+                    motion_overlay_angle_labels += angle_labels
+                    motion_overlay_person_panels += person_panels
+                    if motion_batch_callback:
+                        motion_pending.extend(movement_analyzer.motion_history.last_batch)
+                        if len(motion_pending) >= motion_batch_size:
+                            persist_started = time.perf_counter()
+                            try:
+                                motion_batch_callback(motion_pending)
+                            except Exception as persistence_exc:
+                                raise MotionPersistenceError("Frame-level motion batch persistence failed.") from persistence_exc
+                            profile["motion_analytics_persistence_seconds"] += time.perf_counter() - persist_started
+                            motion_pending = []
+                    for track_id in movement_labels:
+                        movement_track_ids.add(track_id)
+                    if sampled_for_legacy:
+                        pose_frames.append(current_pose_evidence)
+                        pose_frames_sampled += 1
+                        if current_pose_event:
+                            current_pose_event["frame_number"] = int(frame_index)
+                            events.append(current_pose_event)
+                except Exception as exc:
+                    if isinstance(exc, MotionPersistenceError):
+                        raise
+                    if pose_returned:
+                        motion_geometry_failed_frames += 1
+                        if motion_error is None:
+                            motion_error = "Motion geometry failed on one or more pose results."
+                    else:
+                        pose_failed_frames += 1
+                    if (pose_returned and motion_geometry_failed_frames == 1) or (not pose_returned and pose_error is None):
+                        config = current_app.config if has_app_context() else {}
+                        log.error("Pose or per-frame motion processing failed on video frame %s (%s); traceback follows:\n%s",
+                                  frame_index, type(exc).__name__, sanitized_traceback(exc, config))
+                        if not pose_returned:
+                            pose_error = "Pose inference failed on one or more decoded frames; see per-frame analysis counts and server logs."
+                    # Continue to attempt inference on subsequent decoded frames.
+                    current_pose_evidence = None
             if frame_index % interval == 0:
                 read += 1
-                source_frame = frame
-                if detector is not None:
-                    try:
-                        if hasattr(detector, "inspect_with_evidence"):
-                            stage_started = time.perf_counter()
-                            frame, event, pose_evidence = detector.inspect_with_evidence(frame, timestamp)
-                            profile["pose_and_tracking_seconds"] += time.perf_counter() - stage_started
-                            pose_evidence["frame_number"] = int(frame_index)
-                            pose_evidence["detection_method"] = getattr(detector, "METHOD", "pose estimator")
-                            pose_frames.append(pose_evidence)
-                            pose_frames_sampled += 1
-                            pose_frames_with_people += int(pose_evidence.get("person_count", 0) > 0)
-                            for person in pose_evidence.get("people", []):
-                                if person.get("track_id") is not None:
-                                    pose_track_ids.add(person["track_id"])
-                        else:
-                            stage_started = time.perf_counter()
-                            frame, event = detector.inspect(frame, timestamp)
-                            profile["pose_and_tracking_seconds"] += time.perf_counter() - stage_started
-                            pose_frames_sampled += 1
-                        annotated = writer is not None
-                        if event:
-                            event["frame_number"] = int(frame_index)
-                            events.append(event)
-                    except Exception as exc:
-                        config = current_app.config if has_app_context() else {}
-                        log.error("Optional pose inference stopped (%s); traceback follows:\n%s",
-                                  type(exc).__name__, sanitized_traceback(exc, config))
-                        pose_error = "Pose inference stopped after a model error. See server logs for the exception type."
-                        detector = None
                 if object_detector is not None:
                     try:
                         stage_started = time.perf_counter()
@@ -647,6 +956,10 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
                     progress(min(95, int(95 * frame_index / max(frame_count, 1))))
             if writer is not None:
                 try:
+                    # The writer itself is meaningful output on a low-light
+                    # validation-only run (enhanced source plus mode/time
+                    # overlay), even when every optional detector is absent.
+                    annotated = True
                     if zones:
                         from app.services.roi import draw_zones
                         frame = draw_zones(frame, zones)
@@ -710,6 +1023,14 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
             pass
     if read == 0:
         raise VideoError("No readable frames were found in this file.")
+    if motion_pending and motion_batch_callback:
+        persist_started = time.perf_counter()
+        try:
+            motion_batch_callback(motion_pending)
+        except Exception as persistence_exc:
+            raise MotionPersistenceError("Final frame-level motion batch persistence failed.") from persistence_exc
+        profile["motion_analytics_persistence_seconds"] += time.perf_counter() - persist_started
+        motion_pending = []
     fight_events = []
     fight_analysis = {"status": "not_configured", "method": "X3D-M temporal video classification",
                       "candidate_event_count": 0, "error_message": None}
@@ -747,15 +1068,88 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
         profile["restricted_zone_logic_seconds"] += time.perf_counter() - stage_started
     frames_with_faces = sum(1 for item in face_frames if item["face_count"] > 0)
     face_counts = [item["face_count"] for item in face_frames]
+    movement_observations = movement_analyzer.finish()
+    profile.update(movement_analyzer.motion_history.stage_timings)
+    movement_track_ids.update(row.get("track_id") for row in movement_observations
+                              if row.get("track_id") is not None)
+    if pose_error or motion_error:
+        movement_error = "Movement observations are incomplete because pose inference failed."
+    if lighting.get("night_enhancement_applied") and pose_frames_sampled and not pose_frames_with_people:
+        lighting["warnings"].append("No human pose observations were produced from the enhanced sampled frames; movement remains unclassified.")
     if fight_detector is not None:
         fight_inference = float(getattr(fight_detector, "inference_seconds", 0.0) or 0.0)
         profile["x3d_model_inference_seconds"] = fight_inference
         profile["fight_sampling_and_preprocess_seconds"] = max(
             0.0, profile.get("fight_pipeline_seconds", 0.0) - fight_inference)
+    profile["total_processing_seconds"] = time.monotonic() - start
+    profile["decoded_frames"] = decoded_frames
+    profile["pose_inference_attempted_frames"] = pose_attempted_frames
+    profile["pose_processed_frames"] = pose_processed_frames
+    profile["pose_failed_frames"] = pose_failed_frames
+    profile["pose_frames_without_people"] = pose_frames_without_people
+    profile["pose_person_frame_observations"] = pose_person_observations
+    profile["motion_geometry_failed_frames"] = motion_geometry_failed_frames
+    profile["pose_throughput_frames_per_second"] = (round(pose_processed_frames / profile["pose_and_tracking_seconds"], 3)
+        if profile.get("pose_and_tracking_seconds", 0) > 0 else 0.0)
+    profile["pose_model_and_tracker_throughput_frames_per_second"] = (
+        round(pose_processed_frames / profile["pose_model_inference_and_tracker_seconds"], 3)
+        if profile.get("pose_model_inference_and_tracker_seconds", 0) > 0 else 0.0)
+    try:
+        import psutil
+        profile["process_memory_rss_mb"] = round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024), 2)
+    except (ImportError, OSError, AttributeError):
+        profile["process_memory_rss_mb"] = None
     return {"duration": duration, "fps": fps, "width": width, "height": height,
             "processing_seconds": time.monotonic() - start, "sampled_frames": read,
             "annotated_resolution": [output_width, output_height] if annotated else None,
             "stage_timings": {name: round(seconds, 6) for name, seconds in sorted(profile.items())},
+            "lighting": lighting,
+            "night_enhancement_applied": bool(lighting.get("night_enhancement_applied")),
+            "night_enhancement_config": enhancement_config if lighting.get("night_enhancement_applied") else {},
+            "movement_observations": movement_observations,
+            "motion_analytics": {
+                "status": "partial" if pose_error or motion_error or motion_geometry_failed_frames else
+                          "truncated" if movement_analyzer.motion_history.dropped_count else
+                          "complete" if movement_analyzer.motion_history.measurement_count else
+                          "not_configured" if not detector else "empty",
+                "sampling_basis": "every successfully decoded frame; pose attempted on each decoded frame while the pose model was available",
+                "measurements": movement_analyzer.motion_history.ordered(),
+                "measurement_count": movement_analyzer.motion_history.measurement_count,
+                "dropped_measurement_count": movement_analyzer.motion_history.dropped_count,
+                "max_measurements": movement_analyzer.motion_history.max_observations,
+                "storage": "frame_collection" if motion_batch_callback else "embedded_legacy",
+                "analysis_run_id": str(motion_run_id) if motion_batch_callback and motion_run_id else None,
+                "decoded_frames": decoded_frames,
+                "pose_inference_attempted_frames": pose_attempted_frames,
+                "pose_processed_frames": pose_processed_frames,
+                "pose_failed_frames": pose_failed_frames,
+                "frames_with_people": pose_all_frames_with_people,
+                "frames_without_people": pose_frames_without_people,
+                "person_frame_observations": pose_person_observations,
+                "tracked_id_count": len(pose_track_ids),
+                "joint_measurement_count": movement_analyzer.motion_history.joint_measurement_count,
+                "angular_velocity_measurement_count": movement_analyzer.motion_history.angular_velocity_measurement_count,
+                "movement_measurement_count": movement_analyzer.motion_history.measurement_count,
+                "annotated_frames_with_pose_result": motion_overlay_frames,
+                "joint_angle_labels_drawn": motion_overlay_angle_labels,
+                "person_movement_panels_drawn": motion_overlay_person_panels,
+                "motion_geometry_failed_frames": motion_geometry_failed_frames,
+                "timing": {name: round(value, 6) for name, value in profile.items()},
+                "coordinate_note": "2D image-plane estimates; perspective and occlusion affect accuracy. Pixel speed is not real-world speed.",
+                "timing_note": "Ultralytics model.track() time combines pose inference and ByteTrack association; its public call does not expose a reliable separate tracker duration.",
+            },
+            "movement_analysis": {
+                "status": "partial" if pose_error or motion_error else
+                          "complete" if movement_observations else
+                          "inconclusive" if pose_frames_sampled else
+                          "unavailable" if pose_error else "not_configured",
+                "observation_count": len(movement_observations),
+                "tracked_person_count": len(pose_track_ids),
+                "sampling_interval_seconds": interval / fps if fps > 0 else effective_sample_seconds,
+                "tracking_scope": "Temporary IDs within this one video analysis only.",
+                "error_message": movement_error or motion_error or pose_error,
+                "limitations": "Motion categories are heuristic observations, not anomaly, intent, identity, or validated action classifications.",
+            },
             "sample_interval_seconds": interval / fps if fps > 0 else effective_sample_seconds,
             "events": events, "method": getattr(detector, "METHOD", "YOLO pose COCO keypoints")
             if (detector or pose_frames_sampled or pose_error) else
@@ -767,11 +1161,22 @@ def analyze_video(path, sample_seconds, max_duration, detector=None, progress=No
             "annotated_output_error": annotated_output_error,
             "annotated_output_metadata": annotated_output_metadata,
             "pose_frames": pose_frames,
-            "pose_analysis": {"status": "failed" if pose_error else ("complete" if pose_frames_sampled else "not_configured"),
+            "pose_analysis": {"status": "partial" if pose_failed_frames and pose_processed_frames else
+                                  "failed" if pose_error else
+                                  "complete" if pose_processed_frames else "not_configured",
                               "method": getattr(detector, "METHOD", "YOLO pose COCO keypoints") if detector else "YOLO pose COCO keypoints",
                               "model_name": getattr(detector, "model_name", None),
                               "model_version": getattr(detector, "model_version", None),
                               "frames_sampled": pose_frames_sampled,
+                              "decoded_frames": decoded_frames,
+                              "inference_attempted_frames": pose_attempted_frames,
+                              "processed_frames": pose_processed_frames,
+                              "failed_frames": pose_failed_frames,
+                              "frames_without_people": pose_frames_without_people,
+                              "person_frame_observations": pose_person_observations,
+                              "annotated_pose_frames": motion_overlay_frames,
+                              "joint_angle_labels_drawn": motion_overlay_angle_labels,
+                              "movement_panels_drawn": motion_overlay_person_panels,
                               "frames_with_people": pose_frames_with_people,
                               "person_track_count_estimate": len(pose_track_ids),
                               "person_track_count_note": "Approximate temporary pose-tracker IDs; not unique people.",

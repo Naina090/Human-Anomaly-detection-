@@ -142,6 +142,8 @@ def video_report_csv(video, events):
     columns = ["record_type", "video_id", "filename", "status", "duration_seconds",
                "processing_duration_seconds", "annotated_output_status", "annotated_output_format",
                "sample_interval_seconds", "pose_status", "pose_model", "pose_model_version",
+               "lighting_mode", "detected_lighting_mode", "average_brightness",
+               "night_enhancement_applied", "movement_observation_count", "low_visibility_warning_count",
                "pose_frames_sampled", "object_status", "object_model", "object_counts_by_class",
                "person_track_count_estimate", "fight_status", "fight_model", "summary", "event_type", "label",
                "timestamp_seconds", "start_timestamp_seconds", "end_timestamp_seconds",
@@ -160,6 +162,12 @@ def video_report_csv(video, events):
             (video.get("annotated_output_metadata") or {}).get("codec"),
             (video.get("annotated_output_metadata") or {}).get("container")) if value),
         "sample_interval_seconds": (video.get("analysis_settings") or {}).get("sample_every_seconds", ""),
+        "lighting_mode": video.get("lighting_mode", "Not recorded"),
+        "detected_lighting_mode": (video.get("lighting_analysis") or {}).get("detected_mode", "Not recorded"),
+        "average_brightness": video.get("average_brightness", ""),
+        "night_enhancement_applied": video.get("night_enhancement_applied", "Not recorded"),
+        "movement_observation_count": len(video.get("movement_observations") or []),
+        "low_visibility_warning_count": len((video.get("lighting_analysis") or {}).get("warnings") or []),
         "pose_status": (video.get("pose_analysis") or {}).get("status", ""),
         "pose_model": (video.get("pose_analysis") or {}).get("model_name", ""),
         "pose_model_version": (video.get("pose_analysis") or {}).get("model_version", ""),
@@ -171,6 +179,26 @@ def video_report_csv(video, events):
         "fight_status": (video.get("fight_analysis") or {}).get("status", ""),
         "fight_model": (video.get("fight_analysis") or {}).get("model_name", ""),
         "summary": video.get("analysis_summary", "")})
+    # Ordinary movement summaries stay separate from anomaly event records.
+    for movement in video.get("movement_observations") or []:
+        start = movement.get("start_timestamp_seconds")
+        end = movement.get("end_timestamp_seconds")
+        writer.writerow({
+            "record_type": "movement_observation", "video_id": video_id,
+            "filename": video.get("original_filename", ""),
+            "lighting_mode": movement.get("lighting_mode", video.get("lighting_mode", "Not recorded")),
+            "timestamp_seconds": start if isinstance(start, (int, float)) else "",
+            "video_timestamp": (format_video_timestamp(start) or "") if isinstance(start, (int, float)) else "",
+            "start_timestamp_seconds": start if isinstance(start, (int, float)) else "",
+            "end_timestamp_seconds": end if isinstance(end, (int, float)) else "",
+            "event_interval": (f"{format_video_timestamp(start)}-{format_video_timestamp(end)}"
+                               if isinstance(start, (int, float)) and isinstance(end, (int, float)) and end > start else ""),
+            "event_type": "movement_observation", "label": movement.get("category", ""),
+            "track_id": movement.get("track_id", ""),
+            "details": repr({"track_segment_id": movement.get("track_segment_id"),
+                             "evidence_observations": movement.get("evidence_observations"),
+                             "interpretation": movement.get("interpretation", "")}),
+        })
     groups = group_event_episodes(events)
     event_groups = {str(event.get("_id")): group["group_id"] for group in groups
                     for event in group.get("events", [])}
@@ -201,4 +229,72 @@ def video_report_csv(video, events):
     return output.getvalue()
 
 
-__all__ = ["report_data", "video_report_csv", "group_event_episodes", "event_signature"]
+def motion_analytics_csv(video_id, measurements):
+    """Export stored sampled pose geometry; no inference is run during export."""
+    output = io.StringIO(newline="")
+    fields = ["video_id", "tracking_id", "track_segment_id", "frame_number", "source_fps",
+              "video_timestamp_seconds", "movement_duration_seconds", "measurement_valid",
+              "lighting_mode", "joint_name", "raw_angle_degrees", "smoothed_angle_degrees",
+              "angular_change_degrees", "angular_velocity_degrees_per_second",
+              "body_center_x_pixels", "body_center_y_pixels", "body_center_x_normalized",
+              "body_center_y_normalized", "horizontal_displacement_pixels",
+              "vertical_displacement_pixels", "elapsed_seconds", "movement_speed_pixels_per_second",
+              "movement_speed_normalized_per_second", "movement_speed_unit",
+              "movement_direction_degrees", "movement_observation", "keypoint_confidence"]
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for sample in measurements:
+        common = {
+            "video_id": str(sample.get("video_id") or video_id), "tracking_id": sample.get("track_id"),
+            "track_segment_id": _csv_text(sample.get("track_segment_id")),
+            "frame_number": sample.get("frame_number"),
+            "source_fps": _csv_number(sample.get("source_fps"), 4),
+            "video_timestamp_seconds": _csv_number(sample.get("timestamp_seconds"), 4),
+            "movement_duration_seconds": _csv_number(sample.get("movement_duration_seconds"), 4),
+            "measurement_valid": bool(sample.get("measurement_valid", bool(sample.get("joint_measurements")))),
+            "lighting_mode": _csv_text(sample.get("lighting_mode")),
+            "body_center_x_pixels": _csv_number(sample.get("body_center_x_pixels"), 3),
+            "body_center_y_pixels": _csv_number(sample.get("body_center_y_pixels"), 3),
+            "body_center_x_normalized": _csv_number(sample.get("body_center_x_normalized"), 6),
+            "body_center_y_normalized": _csv_number(sample.get("body_center_y_normalized"), 6),
+            "horizontal_displacement_pixels": _csv_number(sample.get("horizontal_displacement_pixels"), 3),
+            "vertical_displacement_pixels": _csv_number(sample.get("vertical_displacement_pixels"), 3),
+            "elapsed_seconds": _csv_number(sample.get("elapsed_seconds"), 6),
+            "movement_speed_pixels_per_second": _csv_number(sample.get("movement_speed_pixels_per_second"), 3),
+            "movement_speed_normalized_per_second": _csv_number(sample.get("movement_speed_normalized_per_second"), 6),
+            "movement_speed_unit": "pixels/second; not calibrated real-world speed",
+            "movement_direction_degrees": _csv_number(sample.get("movement_direction_degrees"), 3),
+            "movement_observation": _csv_text(sample.get("movement_observation")),
+        }
+        joints = sample.get("joint_measurements") or {}
+        if not joints:
+            writer.writerow({**common, "joint_name": "", "raw_angle_degrees": "",
+                             "smoothed_angle_degrees": "", "angular_change_degrees": "",
+                             "angular_velocity_degrees_per_second": "", "keypoint_confidence": ""})
+        for joint, value in joints.items():
+            if not isinstance(value, dict):
+                continue
+            writer.writerow({**common, "joint_name": _csv_text(joint),
+                "raw_angle_degrees": _csv_number(value.get("raw_angle_degrees"), 3),
+                "smoothed_angle_degrees": _csv_number(value.get("smoothed_angle_degrees"), 3),
+                "angular_change_degrees": _csv_number(value.get("angular_change_degrees"), 3),
+                "angular_velocity_degrees_per_second": _csv_number(value.get("angular_velocity_degrees_per_second"), 3),
+                "keypoint_confidence": _csv_number(value.get("keypoint_confidence"), 4)})
+    return output.getvalue()
+
+
+def _csv_number(value, precision):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ""
+    import math
+    return round(float(value), precision) if math.isfinite(float(value)) else ""
+
+
+def _csv_text(value):
+    value = "" if value is None else str(value)
+    if value.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
+__all__ = ["report_data", "video_report_csv", "motion_analytics_csv", "group_event_episodes", "event_signature"]

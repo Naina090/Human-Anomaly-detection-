@@ -1,10 +1,14 @@
 """Optional local Ultralytics pose inference and explainable fall heuristic."""
 import importlib.util
 import os
+import time
 from importlib.metadata import PackageNotFoundError, version
 from threading import local
 
 import numpy as np
+import cv2
+
+from app.services.movement_analysis import COCO_KEYPOINT_NAMES, COCO_SKELETON
 
 
 class DetectorUnavailable(RuntimeError):
@@ -17,6 +21,7 @@ COCO_JOINTS = {
     13: "left_knee", 14: "right_knee",
     15: "left_ankle", 16: "right_ankle",
 }
+COCO_INDEX_TO_NAME = dict(enumerate(COCO_KEYPOINT_NAMES))
 METHOD = "YOLO pose + temporal fall-transition heuristic (research prototype)"
 _WORKER_MODELS = local()
 
@@ -42,6 +47,51 @@ def _worker_pose_model(model_path):
         if callable(reset):
             reset()
     return model
+
+
+def _pose_overlay(frame, people_points, confidences, boxes, box_confidences, track_ids,
+                  keypoint_min_confidence=0.15, overlay_mode="skeleton_tracking"):
+    """Draw COCO-17 skeletons and temporary IDs with confidence-aware joints."""
+    output = frame.copy()
+    height, width = output.shape[:2]
+    for index, points in enumerate(people_points):
+        row_conf = confidences[index] if confidences is not None and index < len(confidences) else None
+        valid = {}
+        for joint_index, point in enumerate(points[:len(COCO_KEYPOINT_NAMES)]):
+            try:
+                x, y = float(point[0]), float(point[1])
+                score = float(row_conf[joint_index]) if row_conf is not None and joint_index < len(row_conf) else 0.0
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(score)):
+                continue
+            if score >= keypoint_min_confidence and -width <= x < 2 * width and -height <= y < 2 * height:
+                valid[joint_index] = (int(round(x)), int(round(y)), score)
+        for first, second in COCO_SKELETON:
+            if first in valid and second in valid:
+                cv2.line(output, valid[first][:2], valid[second][:2], (75, 220, 225), 2, cv2.LINE_AA)
+        for joint_index, (x, y, score) in valid.items():
+            color = (70, 225, 115) if score >= 0.5 else (55, 180, 255)
+            cv2.circle(output, (x, y), 4 if score >= 0.5 else 3, color, -1, cv2.LINE_AA)
+            cv2.circle(output, (x, y), 5, (8, 22, 34), 1, cv2.LINE_AA)
+        # The analysis video is visual evidence: retain available person boxes
+        # even when the legacy control requested a skeleton-only presentation.
+        box = boxes[index] if boxes is not None and index < len(boxes) else None
+        track = track_ids[index] if track_ids is not None and index < len(track_ids) else None
+        if box is not None:
+            try:
+                x1, y1, x2, y2 = [int(round(float(value))) for value in box]
+                cv2.rectangle(output, (x1, y1), (x2, y2), (73, 208, 230), 2, cv2.LINE_AA)
+                confidence = (float(box_confidences[index]) if box_confidences is not None
+                              and index < len(box_confidences) else None)
+                identity_label = f"Person ID {int(float(track))}" if track is not None and float(track) >= 0 else "Person · ID unavailable"
+                if confidence is not None and np.isfinite(confidence):
+                    identity_label += f" · {confidence:.2f}"
+                cv2.putText(output, identity_label, (max(0, x1), max(18, y1 - 7)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (73, 208, 230), 1, cv2.LINE_AA)
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return output
 
 
 def detector_status(model_path):
@@ -90,6 +140,7 @@ class YoloPoseFallDetector:
         # A new detector/model is constructed for every video job, so Ultralytics'
         # persistent tracker state cannot leak from one uploaded video to another.
         self.tracker = str(settings.get("tracker", "bytetrack.yaml") or "bytetrack.yaml")
+        self.overlay_mode = str(settings.get("overlay_mode", "skeleton_tracking"))
         self.transition_window_seconds = max(.2, float(settings.get("transition_window_seconds", 1.5)))
         self.minimum_vertical_drop = max(.01, min(.8, float(settings.get("minimum_vertical_drop", .12))))
         self.minimum_horizontal_persistence = max(.2, float(settings.get("minimum_horizontal_persistence", .6)))
@@ -104,37 +155,46 @@ class YoloPoseFallDetector:
         self.drop_fraction = None
         self.drop_start_at = None
         self.emitted = False
+        self.last_model_track_seconds = 0.0
 
     def inspect(self, frame, timestamp):
         """Compatibility interface for earlier callers: return overlay and candidate."""
         overlay, event, _evidence = self.inspect_with_evidence(frame, timestamp)
         return overlay, event
 
-    def inspect_with_evidence(self, frame, timestamp):
+    def inspect_with_evidence(self, frame, timestamp, update_transition=True):
         """Return annotated frame, optional candidate, and compact sampled pose evidence."""
         # Pose estimation provides person boxes and keypoints in the same result.
         # Ultralytics tracking attaches temporary IDs; retain a predict fallback
         # for older compatible integrations and lightweight test doubles.
         track = getattr(self.model, "track", None)
-        if callable(track):
-            results = track(frame, persist=True, tracker=getattr(self, "tracker", "bytetrack.yaml"), verbose=False)
-        else:
-            results = self.model.predict(frame, verbose=False)
+        model_started = time.perf_counter()
+        self.last_model_track_seconds = 0.0
+        try:
+            if callable(track):
+                results = track(frame, persist=True, tracker=getattr(self, "tracker", "bytetrack.yaml"), verbose=False)
+            else:
+                results = self.model.predict(frame, verbose=False)
+        finally:
+            self.last_model_track_seconds = time.perf_counter() - model_started
         if not results:
-            self._reset_transition()
+            if update_transition:
+                self._reset_transition()
             return frame, None, self._empty_evidence(timestamp)
         result = results[0]
         keypoints = getattr(result, "keypoints", None)
         xy = getattr(keypoints, "xy", None) if keypoints is not None else None
         if xy is None:
-            self._reset_transition()
+            if update_transition:
+                self._reset_transition()
             return result.plot(), None, self._empty_evidence(timestamp)
         pts = xy.cpu().numpy() if hasattr(xy, "cpu") else xy.numpy() if hasattr(xy, "numpy") else xy
         conf_tensor = getattr(keypoints, "conf", None)
         confs = conf_tensor.cpu().numpy() if conf_tensor is not None and hasattr(conf_tensor, "cpu") else (
             conf_tensor.numpy() if conf_tensor is not None and hasattr(conf_tensor, "numpy") else conf_tensor)
         if len(pts) == 0:
-            self._reset_transition()
+            if update_transition:
+                self._reset_transition()
             return result.plot(), None, self._empty_evidence(timestamp)
         boxes = getattr(result, "boxes", None)
         box_tensor = getattr(boxes, "xyxy", None) if boxes is not None else None
@@ -155,9 +215,12 @@ class YoloPoseFallDetector:
         for person_idx, person_points in enumerate(pts):
             confidence_row = confs[person_idx] if confs is not None and person_idx < len(confs) else None
             joints = {}
-            for point_idx, joint_name in COCO_JOINTS.items():
+            for point_idx, joint_name in COCO_INDEX_TO_NAME.items():
+                if point_idx >= len(person_points):
+                    continue
                 point = person_points[point_idx]
-                confidence = float(confidence_row[point_idx]) if confidence_row is not None else None
+                confidence = (float(confidence_row[point_idx]) if confidence_row is not None
+                              and point_idx < len(confidence_row) else None)
                 joints[joint_name] = {
                     "x": round(float(point[0]), 2), "y": round(float(point[1]), 2),
                     "confidence": round(confidence, 5) if confidence is not None else None,
@@ -187,6 +250,24 @@ class YoloPoseFallDetector:
             evidence_people.append({"keypoints": joints, "bbox_xyxy": bbox,
                                     "detection_confidence": box_confidence, "track_id": track_id})
 
+        annotated_frame = _pose_overlay(frame, pts, confs, boxes_array,
+                                        box_confidences, track_ids,
+                                        overlay_mode=getattr(self, "overlay_mode", "skeleton_tracking"))
+
+        # Tracking and pose extraction run for every decoded frame. The legacy
+        # fall-transition heuristic intentionally advances only at its prior
+        # sampled cadence so this motion upgrade does not change fall behavior.
+        if not update_transition:
+            return annotated_frame, None, {
+                "timestamp_seconds": float(timestamp), "person_count": int(len(pts)),
+                "model_name": getattr(self, "model_name", None),
+                "model_version": getattr(self, "model_version", None),
+                "keypoint_names": list(COCO_KEYPOINT_NAMES), "people": evidence_people,
+                "tracker": getattr(self, "tracker", "predict_fallback"),
+                "tracking_status": "tracked" if any(p.get("track_id") is not None for p in evidence_people) else "ids_unavailable",
+                "transition_status": "not_evaluated_this_frame",
+            }
+
         # Continue the fall heuristic with the pose having the strongest shoulder/hip evidence.
         person_ids = [person.get("track_id") for person in evidence_people]
         eligible = []
@@ -204,10 +285,10 @@ class YoloPoseFallDetector:
             evidence = {"timestamp_seconds": float(timestamp), "person_count": int(len(pts)),
                         "model_name": getattr(self, "model_name", None),
                         "model_version": getattr(self, "model_version", None),
-                        "keypoint_names": list(COCO_JOINTS.values()), "people": evidence_people,
+                        "keypoint_names": list(COCO_KEYPOINT_NAMES), "people": evidence_people,
                         "transition_status": "inconclusive_low_confidence",
                         "tracking_status": "tracked" if any(value is not None for value in person_ids) else "ids_unavailable"}
-            return result.plot(), None, evidence
+            return annotated_frame, None, evidence
         prior_track_id = getattr(self, "track_id", None)
         if (prior_track_id is not None and prior_track_id in person_ids
                 and person_ids.index(prior_track_id) in eligible):
@@ -225,7 +306,7 @@ class YoloPoseFallDetector:
         evidence = {"timestamp_seconds": float(timestamp), "person_count": int(len(pts)),
                     "model_name": getattr(self, "model_name", None),
                     "model_version": getattr(self, "model_version", None),
-                    "keypoint_names": list(COCO_JOINTS.values()), "people": evidence_people,
+                    "keypoint_names": list(COCO_KEYPOINT_NAMES), "people": evidence_people,
                     "selected_person_index": idx,
                     "selected_torso_confidence": round(confidence_mean, 5) if confidence_mean is not None else None}
         person_bbox = None
@@ -238,11 +319,11 @@ class YoloPoseFallDetector:
         if confidence_mean is not None and confidence_mean < .25:
             self._reset_transition()
             evidence["transition_status"] = "inconclusive_low_confidence"
-            return result.plot(), None, evidence
+            return annotated_frame, None, evidence
         if not all(float(k[i][1]) >= 0 for i in (5, 6, 11, 12)):
             self._reset_transition()
             evidence["transition_status"] = "inconclusive_missing_torso"
-            return result.plot(), None, evidence
+            return annotated_frame, None, evidence
 
         shoulder = k[[5, 6]].mean(axis=0)
         hip = k[[11, 12]].mean(axis=0)
@@ -281,7 +362,7 @@ class YoloPoseFallDetector:
                 self.previous = (float(timestamp), center_y)
                 evidence["transition_status"] = "candidate_below_score_threshold"
                 evidence["anomaly_score"] = round(float(score), 4)
-                return result.plot(), None, evidence
+                return annotated_frame, None, evidence
             event = {
                 "event_type": "potential_fall", "label": "Potential fall candidate",
                 "timestamp_seconds": float(timestamp),
@@ -313,7 +394,7 @@ class YoloPoseFallDetector:
         evidence["transition_status"] = "candidate_emitted" if event else (
             "upright_seen" if self.upright_seen else "observed_no_candidate")
         evidence["torso_horizontal_ratio"] = round(torso_ratio, 4)
-        return result.plot(), event, evidence
+        return annotated_frame, event, evidence
 
     @staticmethod
     def _empty_evidence(timestamp):

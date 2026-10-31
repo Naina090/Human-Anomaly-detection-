@@ -21,6 +21,24 @@ class Config:
     PROCESSED_DIR = os.getenv("PROCESSED_DIR", str(BASE_DIR / "processed"))
     LOCAL_FALLBACK_PATH = os.getenv("LOCAL_FALLBACK_PATH", str(BASE_DIR / "instance" / "local_history.json"))
     SAMPLE_EVERY_SECONDS = float(os.getenv("SAMPLE_EVERY_SECONDS", "1.0"))
+    # Low-light assessment samples frames across each video. Brightness uses
+    # grayscale luminance (0..255); enhancement is limited to classified or
+    # manually selected low-light footage.
+    LIGHTING_SAMPLE_FRAMES = int(os.getenv("LIGHTING_SAMPLE_FRAMES", "7"))
+    LIGHTING_BRIGHTNESS_THRESHOLD = float(os.getenv("LIGHTING_BRIGHTNESS_THRESHOLD", "70"))
+    LIGHTING_LOW_FRAME_FRACTION = float(os.getenv("LIGHTING_LOW_FRAME_FRACTION", "0.6"))
+    NIGHT_ENHANCEMENT_CLAHE_CLIP_LIMIT = float(os.getenv("NIGHT_ENHANCEMENT_CLAHE_CLIP_LIMIT", "2.2"))
+    NIGHT_ENHANCEMENT_GAMMA = float(os.getenv("NIGHT_ENHANCEMENT_GAMMA", "0.78"))
+    NIGHT_ENHANCEMENT_BRIGHTNESS_OFFSET = float(os.getenv("NIGHT_ENHANCEMENT_BRIGHTNESS_OFFSET", "8"))
+    NIGHT_ENHANCEMENT_DENOISE = os.getenv("NIGHT_ENHANCEMENT_DENOISE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    MOVEMENT_MIN_OBSERVATIONS = int(os.getenv("MOVEMENT_MIN_OBSERVATIONS", "2"))
+    MOVEMENT_KEYPOINT_CONFIDENCE = float(os.getenv("MOVEMENT_KEYPOINT_CONFIDENCE", "0.3"))
+    MOVEMENT_MAX_OBSERVATION_GAP_SECONDS = float(os.getenv("MOVEMENT_MAX_OBSERVATION_GAP_SECONDS", "2.5"))
+    # Legacy embedded limit remains for old/isolated callers. The analysis
+    # worker streams all frame-level measurements to the side collection in batches.
+    MOTION_ANALYTICS_MAX_OBSERVATIONS = int(os.getenv("MOTION_ANALYTICS_MAX_OBSERVATIONS", "2000"))
+    MOTION_ANALYTICS_BATCH_SIZE = int(os.getenv("MOTION_ANALYTICS_BATCH_SIZE", "100"))
+    MOTION_OVERLAY_MODE = os.getenv("MOTION_OVERLAY_MODE", "skeleton_tracking").strip().lower()
     # Active polygon zones need denser observations than the default general
     # analysis cadence to establish a tracked boundary transition.
     ZONE_TRACK_SAMPLE_SECONDS = float(os.getenv("ZONE_TRACK_SAMPLE_SECONDS", "0.5"))
